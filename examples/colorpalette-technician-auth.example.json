@@ -1,0 +1,20 @@
+{
+  "loginUrl": "https://usauth.superops.ai/#/login",
+  "locators": {
+    "username": {
+      "by": "label",
+      "value": "Email"
+    },
+    "password": {
+      "by": "label",
+      "value": "Password"
+    },
+    "submit": {
+      "by": "role",
+      "role": "button",
+      "name": "Login"
+    }
+  },
+  "success": null,
+  "successConditionStatus": "unresolved: requires one authenticated test to observe the destination"
+}
