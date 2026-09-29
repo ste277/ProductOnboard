@@ -12,6 +12,7 @@ import { captureRuntimePage, RuntimeCaptureError } from "./runtime-capture.js";
 import { probeRuntimeNavigation } from "./navigation-probe.js";
 import { discoverRuntimeNavigation } from "./runtime-discovery.js";
 import { reconcileProductEvidence } from "./evidence-reconciliation.js";
+import { buildFeatureModel } from "./feature-model.js";
 import type { ProductEvidenceGraph } from "./product-evidence-graph.js";
 import type { RuntimeNavigationDiscoveryGraph } from "./runtime-discovery.js";
 
@@ -56,6 +57,22 @@ if (!command) {
       const staticGraph = JSON.parse(await readFile(inputs.staticPath, "utf8")) as ProductEvidenceGraph;
       const runtimeDiscovery = JSON.parse(await readFile(inputs.runtimePath, "utf8")) as RuntimeNavigationDiscoveryGraph;
       console.log(JSON.stringify(reconcileProductEvidence({ staticGraph, runtimeDiscovery }), null, 2));
+    } catch (error) {
+      console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }, null, 2));
+      process.exitCode = 1;
+    }
+  }
+} else if (command === "features") {
+  const inputs = readFeatureFlags(process.argv.slice(3));
+  if (!inputs) {
+    console.error("Usage: source-inventory features --static <static-graph.json> --runtime <runtime-discovery.json> --reconciliation <reconciliation.json>");
+    process.exitCode = 1;
+  } else {
+    try {
+      const staticGraph = JSON.parse(await readFile(inputs.staticPath, "utf8"));
+      const runtimeDiscovery = JSON.parse(await readFile(inputs.runtimePath, "utf8"));
+      const reconciliation = JSON.parse(await readFile(inputs.reconciliationPath, "utf8"));
+      console.log(JSON.stringify(buildFeatureModel({ staticGraph, runtimeDiscovery, reconciliation }), null, 2));
     } catch (error) {
       console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }, null, 2));
       process.exitCode = 1;
@@ -162,6 +179,28 @@ function readReconcileFlags(arguments_: string[]): { staticPath: string; runtime
     else return undefined;
   }
   return staticPath && runtimePath ? { staticPath, runtimePath } : undefined;
+}
+
+function readFeatureFlags(arguments_: string[]): {
+  staticPath: string;
+  runtimePath: string;
+  reconciliationPath: string;
+} | undefined {
+  let staticPath: string | undefined;
+  let runtimePath: string | undefined;
+  let reconciliationPath: string | undefined;
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const flag = arguments_[index];
+    const value = arguments_[index + 1];
+    if (!value) return undefined;
+    if (flag === "--static") staticPath = value;
+    else if (flag === "--runtime") runtimePath = value;
+    else if (flag === "--reconciliation") reconciliationPath = value;
+    else return undefined;
+  }
+  return staticPath && runtimePath && reconciliationPath
+    ? { staticPath, runtimePath, reconciliationPath }
+    : undefined;
 }
 
 function readDiscoveryFlags(arguments_: string[]): {

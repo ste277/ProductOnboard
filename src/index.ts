@@ -229,6 +229,29 @@ export {
 } from "./evidence-reconciliation.js";
 
 export {
+  buildFeatureModel,
+  formatFeatureModel,
+  getFeature,
+  getFeaturesByEvidenceStatus,
+  getFeaturesByRoute,
+  validateFeatureModel,
+  type BuildFeatureModelInput,
+  type FeatureCandidate,
+  type FeatureEntryPoint,
+  type FeatureEvidenceItem,
+  type FeatureEvidenceStatus,
+  type FeatureModel,
+  type FeatureModelSummary,
+  type FeatureNameSource,
+  type FeatureNameSourceType,
+  type FeatureRelationship,
+  type FeatureRuntimeReference,
+  type FeatureScreenshot,
+  type FeatureStaticReference,
+  type UnassignedFeatureEvidence,
+} from "./feature-model.js";
+
+export {
   AuthenticationSessionError,
   createAuthenticatedSession,
   type AuthenticationCredentials,
