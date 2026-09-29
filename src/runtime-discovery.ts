@@ -59,7 +59,16 @@ export interface RuntimeStateNode {
   interactionCandidates: RuntimeInteractionCandidate[];
   accessibility: RuntimeCaptureManifest["accessibility"];
   visibleText: RuntimeCaptureManifest["text"];
+  runtimeCaptureId: string;
+  network: RuntimeCaptureManifest["network"];
+  networkObservations: RuntimeNetworkEvidenceObservation[];
   provenance: "runtime-capture" | "runtime-probe";
+}
+
+export interface RuntimeNetworkEvidenceObservation {
+  sourceId: string;
+  sourceType: "runtime-capture" | "runtime-probe-after";
+  network: RuntimeCaptureManifest["network"];
 }
 
 export interface RuntimeTransitionEdge {
@@ -74,6 +83,8 @@ export interface RuntimeTransitionEdge {
   stopReasons: RuntimeDiscoveryBranchStopReason[];
   baselineMutationMethods: string[];
   mutationMethods: string[];
+  runtimeProbeId: string;
+  network: RuntimeCaptureManifest["network"];
   failure?: string;
   provenance: "runtime-probe";
 }
@@ -216,6 +227,10 @@ export async function discoverRuntimeNavigation(
       if (boundary) addStop(stopReasons, "origin-boundary");
 
       let destinationId = existingId ?? null;
+      if (existingId) {
+        const existingNode = graph.nodes.find((item) => item.id === existingId)!;
+        addNetworkObservation(existingNode, probe.after);
+      }
       if (!existingId) {
         if (graph.nodes.length >= limits.maxStates) {
           stateLimited = true;
@@ -319,6 +334,13 @@ function makeNode(
     interactionCandidates: manifest.interactionCandidates,
     accessibility: manifest.accessibility,
     visibleText: manifest.text,
+    runtimeCaptureId: manifest.id,
+    network: manifest.network,
+    networkObservations: [{
+      sourceId: manifest.id,
+      sourceType: provenance === "runtime-capture" ? "runtime-capture" : "runtime-probe-after",
+      network: manifest.network,
+    }],
     provenance,
   };
 }
@@ -341,6 +363,8 @@ function edgeFromProbe(
     stopReasons,
     baselineMutationMethods,
     mutationMethods: observedMutationMethods,
+    runtimeProbeId: probe.id,
+    network: probe.transition?.network ?? [],
     ...(failure ? { failure } : probe.interaction.failure ? { failure: probe.interaction.failure } : {}),
     provenance: "runtime-probe",
   };
@@ -352,8 +376,20 @@ function failedEdge(from: string, target: DiscoveryTarget, error: unknown): Runt
     id: `runtime-transition:${stableHash(`${from}|${target.id}|failed`)}`,
     from, to: null, target, safety, interactionPerformed: false, transition: null,
     status: "failed", stopReasons: ["probe-failed"], baselineMutationMethods: [], mutationMethods: [],
+    runtimeProbeId: `runtime-probe-failed:${stableHash(`${from}|${target.id}`)}`,
+    network: [],
     failure: error instanceof Error ? error.message : String(error), provenance: "runtime-probe",
   };
+}
+
+function addNetworkObservation(node: RuntimeStateNode, manifest: RuntimeCaptureManifest): void {
+  if (node.networkObservations.some((item) => item.sourceId === manifest.id)) return;
+  node.networkObservations.push({
+    sourceId: manifest.id,
+    sourceType: "runtime-probe-after",
+    network: manifest.network,
+  });
+  node.networkObservations.sort((left, right) => left.sourceId.localeCompare(right.sourceId));
 }
 
 function skipped(

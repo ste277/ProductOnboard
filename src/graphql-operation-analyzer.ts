@@ -168,6 +168,14 @@ export interface GraphqlExecution {
   awaited: boolean;
   executorImportLocation?: SourceLocation;
   clientInstanceLocation?: SourceLocation;
+  transport?: GraphqlTransportEvidence;
+  location: SourceLocation;
+}
+
+export interface GraphqlTransportEvidence {
+  client: "ApolloClient";
+  configuration: "uri";
+  endpoint: { kind: "static"; value: string } | { kind: "dynamic"; expression: string };
   location: SourceLocation;
 }
 
@@ -185,6 +193,7 @@ interface ImportedExecutor {
 interface ApolloClientInstance {
   importLocation: SourceLocation;
   instanceLocation: SourceLocation;
+  transport?: GraphqlTransportEvidence;
 }
 
 interface MutationExecutor {
@@ -517,6 +526,7 @@ function collectApolloClients(
       evidence.clients.set(declaration.name.text, {
         importLocation,
         instanceLocation: getLocation(declaration, sourceFile, filePath),
+        ...readApolloTransport(declaration.initializer, sourceFile, filePath),
       });
     }
   }
@@ -682,10 +692,36 @@ function readExecution(
       ...readVariablesFromOptions(config, sourceFile, filePath),
       executorImportLocation: client.importLocation,
       clientInstanceLocation: client.instanceLocation,
+      ...(client.transport ? { transport: client.transport } : {}),
     };
   }
 
   return undefined;
+}
+
+function readApolloTransport(
+  client: ts.NewExpression,
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): { transport?: GraphqlTransportEvidence } {
+  const config = client.arguments?.[0];
+  if (!config || !ts.isObjectLiteralExpression(config)) return {};
+  for (const property of config.properties) {
+    if (!ts.isPropertyAssignment(property) || getPropertyName(property.name, sourceFile) !== "uri") continue;
+    const value = unwrapParentheses(property.initializer);
+    const endpoint = ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)
+      ? { kind: "static" as const, value: value.text }
+      : { kind: "dynamic" as const, expression: value.getText(sourceFile) };
+    return {
+      transport: {
+        client: "ApolloClient",
+        configuration: "uri",
+        endpoint,
+        location: getLocation(property, sourceFile, filePath),
+      },
+    };
+  }
+  return {};
 }
 
 function readDocumentReference(

@@ -76,6 +76,7 @@ export interface RuntimeProbeTransition {
   popupAppeared: boolean;
   mutationMethods: Array<"POST" | "PUT" | "PATCH" | "DELETE">;
   highSeveritySafetyIssue: boolean;
+  network: RuntimeNetworkObservation[];
   provenance: Array<"before-runtime" | "after-runtime" | "network" | "accessibility">;
 }
 
@@ -423,7 +424,7 @@ function observePage(page: Page): RuntimeObservers {
 function attachObservers(page: Page, observers: RuntimeObservers): void {
   page.on("request", (request) => {
     const observation: RuntimeNetworkObservation = { id: "", method: request.method(), url: sanitizeRuntimeUrl(request.url()),
-      resourceType: request.resourceType(), provenance: "network" };
+      resourceType: request.resourceType(), status: null, provenance: "network" };
     observers.network.push(observation);
     observers.requests.set(request, observation);
   });
@@ -468,8 +469,15 @@ function buildTransition(
     interactionCandidatesChanged: evidenceIds(before.interactionCandidates) !== evidenceIds(after.interactionCandidates),
     networkObserved: network.length > 0, dialogAppeared: afterDialogs > beforeDialogs,
     popupAppeared, mutationMethods, highSeveritySafetyIssue: mutationMethods.length > 0,
+    network: normalizedTransitionNetwork(network),
     provenance: ["before-runtime", "after-runtime", "network", "accessibility"],
   };
+}
+
+function normalizedTransitionNetwork(network: RuntimeNetworkObservation[]): RuntimeNetworkObservation[] {
+  const result = network.map((item) => ({ ...item }));
+  normalizeNetwork(result);
+  return result;
 }
 
 function evidenceIds(items: Array<{ id: string }>): string { return items.map((item) => item.id).sort().join("|"); }

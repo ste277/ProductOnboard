@@ -280,6 +280,36 @@ test("associates inline callback execution with its own callable identity", asyn
   assert.notEqual(execution?.caller?.name, "load");
 });
 
+test("retains only explicit Apollo transport endpoints with source provenance", async () => {
+  const repository = await createRepository("graphql transport ");
+  await createFile(repository, "src/client.ts", [
+    'import { ApolloClient, gql } from "@apollo/client";',
+    'const relative = new ApolloClient({ uri: "/graphql" });',
+    'const absolute = new ApolloClient({ uri: "https://api.example.test/gql" });',
+    "const dynamic = new ApolloClient({ uri: graphqlEndpoint });",
+    "const implicit = new ApolloClient({});",
+    "const DOC = gql`query One { one } query Two { two }`;",
+    "relative.query({ query: DOC });",
+    "absolute.query({ query: DOC });",
+    "dynamic.query({ query: DOC });",
+    "implicit.query({ query: DOC });",
+    "",
+  ].join("\n"));
+  const manifest = await analyzeRepository(repository);
+  const [relative, absolute, dynamic, implicit] = manifest.executions;
+  assert.deepEqual(relative?.transport, {
+    client: "ApolloClient", configuration: "uri", endpoint: { kind: "static", value: "/graphql" },
+    location: { path: "src/client.ts", startLine: 2, endLine: 2 },
+  });
+  assert.equal(absolute?.transport?.endpoint.kind, "static");
+  assert.deepEqual(absolute?.transport?.endpoint, { kind: "static", value: "https://api.example.test/gql" });
+  assert.deepEqual(dynamic?.transport?.endpoint, { kind: "dynamic", expression: "graphqlEndpoint" });
+  assert.equal(implicit?.transport, undefined);
+  assert.equal(manifest.documents[0]?.status, "ok");
+  if (manifest.documents[0]?.status === "ok") assert.equal(manifest.documents[0].operations.length, 2);
+  assert.equal(Object.hasOwn(relative?.transport ?? {}, "operationExecuted"), false);
+});
+
 test("analyzes proven GraphQL documents in TS, TSX, JS, and JSX", async () => {
   const repository = await createRepository("graphql languages ");
   await createFile(

@@ -11,6 +11,9 @@ import { scanRepository } from "./repository-scanner.js";
 import { captureRuntimePage, RuntimeCaptureError } from "./runtime-capture.js";
 import { probeRuntimeNavigation } from "./navigation-probe.js";
 import { discoverRuntimeNavigation } from "./runtime-discovery.js";
+import { reconcileProductEvidence } from "./evidence-reconciliation.js";
+import type { ProductEvidenceGraph } from "./product-evidence-graph.js";
+import type { RuntimeNavigationDiscoveryGraph } from "./runtime-discovery.js";
 
 const command = process.argv[2];
 
@@ -40,6 +43,21 @@ if (!command) {
         null,
         2,
       ));
+      process.exitCode = 1;
+    }
+  }
+} else if (command === "reconcile") {
+  const inputs = readReconcileFlags(process.argv.slice(3));
+  if (!inputs) {
+    console.error("Usage: source-inventory reconcile --static <static-graph.json> --runtime <runtime-discovery.json>");
+    process.exitCode = 1;
+  } else {
+    try {
+      const staticGraph = JSON.parse(await readFile(inputs.staticPath, "utf8")) as ProductEvidenceGraph;
+      const runtimeDiscovery = JSON.parse(await readFile(inputs.runtimePath, "utf8")) as RuntimeNavigationDiscoveryGraph;
+      console.log(JSON.stringify(reconcileProductEvidence({ staticGraph, runtimeDiscovery }), null, 2));
+    } catch (error) {
+      console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }, null, 2));
       process.exitCode = 1;
     }
   }
@@ -130,6 +148,20 @@ if (!command) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   }
+}
+
+function readReconcileFlags(arguments_: string[]): { staticPath: string; runtimePath: string } | undefined {
+  let staticPath: string | undefined;
+  let runtimePath: string | undefined;
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const flag = arguments_[index];
+    const value = arguments_[index + 1];
+    if (!value) return undefined;
+    if (flag === "--static") staticPath = value;
+    else if (flag === "--runtime") runtimePath = value;
+    else return undefined;
+  }
+  return staticPath && runtimePath ? { staticPath, runtimePath } : undefined;
 }
 
 function readDiscoveryFlags(arguments_: string[]): {

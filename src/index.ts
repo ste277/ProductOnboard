@@ -109,6 +109,7 @@ export {
   type GraphqlOperationType,
   type GraphqlParseError,
   type GraphqlSelection,
+  type GraphqlTransportEvidence,
   type GraphqlValue,
   type GraphqlVariableDefinition,
   type StaticGraphqlValue,
@@ -201,10 +202,31 @@ export {
   type RuntimeDiscoverySummary,
   type RuntimeNavigationDiscoveryGraph,
   type RuntimeNavigationDiscoveryOptions,
+  type RuntimeNetworkEvidenceObservation,
   type RuntimeSkippedTarget,
   type RuntimeStateNode,
   type RuntimeTransitionEdge,
 } from "./runtime-discovery.js";
+
+export {
+  formatReconciliationSummary,
+  getAmbiguousEvidence,
+  getCorroboratedEvidence,
+  getRuntimeOnlyEvidence,
+  getStaticOnlyEvidence,
+  reconcileProductEvidence,
+  validateReconciliationManifest,
+  type ReconciledEvidenceResult,
+  type ReconciliationCoverage,
+  type ReconciliationDomain,
+  type ReconciliationDomainSummary,
+  type ReconciliationManifest,
+  type ReconciliationRuntimeReference,
+  type ReconciliationStaticReference,
+  type ReconciliationStatus,
+  type ReconciliationStrength,
+  type ReconcileProductEvidenceInput,
+} from "./evidence-reconciliation.js";
 
 export {
   AuthenticationSessionError,

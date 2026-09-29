@@ -169,6 +169,24 @@ test("does not guess an operation for a multi-operation document", async () => {
   ));
 });
 
+test("carries explicit GraphQL transport evidence into execution nodes", async () => {
+  const graph = await graphFor([
+    "src/graphql-transport.ts",
+    [
+      'import { ApolloClient, gql } from "@apollo/client";',
+      'const client = new ApolloClient({ uri: "/graphql" });',
+      "const DOC = gql`query Tickets { tickets { id } }`;",
+      "client.query({ query: DOC });",
+      "",
+    ].join("\n"),
+  ]);
+  const execution = graph.nodes.find((node) => node.type === "graphql-execution");
+  assert.deepEqual(execution?.data.transport, {
+    client: "ApolloClient", configuration: "uri", endpoint: { kind: "static", value: "/graphql" },
+    location: { path: "src/graphql-transport.ts", startLine: 2, endLine: 2 },
+  });
+});
+
 test("supports lookup helpers and terminates traces across recursive cycles", async () => {
   const graph = await graphFor([
     "src/cycles.ts",

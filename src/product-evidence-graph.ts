@@ -468,6 +468,7 @@ export function buildProductEvidenceGraph(
         operationType: execution.operationType,
         document: execution.document,
         scope: execution.scope,
+        ...(execution.transport ? { transport: execution.transport } : {}),
       });
     if (execution.caller && callableIds.has(execution.caller.id)) {
       addEdge(graph, ids, "PERFORMS_GRAPHQL_EXECUTION",

@@ -130,7 +130,7 @@ export interface RuntimeNetworkObservation {
   method: string;
   url: string;
   resourceType: string;
-  status?: number;
+  status: number | null;
   provenance: "network";
 }
 
@@ -295,6 +295,7 @@ export async function captureRuntimePage(
         method: request.method(),
         url: sanitizeRuntimeUrl(request.url()),
         resourceType: request.resourceType(),
+        status: null,
         provenance: "network",
       };
       network.push(observation);

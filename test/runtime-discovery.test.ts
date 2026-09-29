@@ -37,6 +37,9 @@ beforeEach(async () => {
     requests.push({ method: request.method ?? "GET", path: url.pathname,
       ...(request.headers.cookie ? { cookie: request.headers.cookie } : {}) });
     if (url.pathname === "/api/surprise") { response.writeHead(204); response.end(); return; }
+    if (url.pathname === "/api/config") {
+      response.writeHead(200, { "content-type": "application/json" }); response.end('{"ok":true}'); return;
+    }
     if (url.pathname === "/dashboard") return html(response,
       "<!doctype html><title>Dashboard</title><h1>Dashboard</h1><a href='/'>Home</a>");
     if (url.pathname === "/tickets") return html(response,
@@ -157,6 +160,42 @@ test("state fingerprint excludes temporal artifacts and distinguishes structural
   assert.notEqual(fingerprintRuntimeState(changedUi), fingerprintRuntimeState(capture));
 });
 
+test("retains privacy-safe state and transition network evidence with source provenance", async () => {
+  const graph = await discover({ maxDepth: 1, maxStates: 4, maxTransitions: 1, maxTargetsPerState: 1 });
+  const root = graph.nodes[0];
+  const edge = graph.transitions[0];
+  assert.ok(root);
+  assert.ok(edge);
+  assert.equal(root.runtimeCaptureId, root.networkObservations[0]?.sourceId);
+  assert.equal(root.networkObservations[0]?.sourceType, "runtime-capture");
+  assert.ok(root.network.some((item) => item.method === "GET" && item.resourceType === "document" && item.status === 200));
+  const config = root.network.find((item) => item.url.includes("/api/config"));
+  assert.ok(config?.url.includes("token=%5BREDACTED%5D"));
+  assert.equal(edge.runtimeProbeId.startsWith("runtime-probe:"), true);
+  assert.ok(edge.network.some((item) => item.method === "GET" && item.resourceType === "document"));
+  for (const observation of [...root.network, ...edge.network]) {
+    assert.ok(observation.id);
+    assert.equal(Object.hasOwn(observation, "body"), false);
+    assert.equal(Object.hasOwn(observation, "responseBody"), false);
+    assert.equal(Object.hasOwn(observation, "headers"), false);
+    assert.equal(Object.hasOwn(observation, "authorization"), false);
+    assert.equal(Object.hasOwn(observation, "cookies"), false);
+    assert.equal(typeof observation.status === "number" || observation.status === null, true);
+  }
+  assert.doesNotThrow(() => JSON.stringify(graph));
+});
+
+test("deduplicated states retain separate network observation sets without changing identity", async () => {
+  const graph = await discover({ maxDepth: 2, maxStates: 12, maxTransitions: 20, maxTargetsPerState: 12 });
+  const home = graph.nodes.find((node) => node.url === `${baseUrl}/` && node.depth === 0);
+  assert.ok(home);
+  assert.ok(home.networkObservations.length >= 2);
+  assert.equal(new Set(home.networkObservations.map((item) => item.sourceId)).size, home.networkObservations.length);
+  const before = home.fingerprint;
+  home.networkObservations.push({ sourceId: "synthetic-observation", sourceType: "runtime-probe-after", network: [] });
+  assert.equal(home.fingerprint, before);
+});
+
 test("structural discovery graph is reproducible and CLI/API support anonymous discovery", async () => {
   const limits = { maxDepth: 1, maxStates: 8, maxTransitions: 8, maxTargetsPerState: 8 };
   const first = await discover(limits);
@@ -214,6 +253,7 @@ function homeFixture(external: string): string {
     <div id="requester" style="cursor:pointer">Login as requester</div>
     <div id="technician" style="cursor:pointer">Login as technician</div>
     <script>
+      fetch('/api/config?token=private');
       document.querySelector('#requester').addEventListener('click', () => {
         document.body.innerHTML = '<h1>Email Login</h1><label>Email <input aria-label="Email"></label><button>Next</button>';
       });
