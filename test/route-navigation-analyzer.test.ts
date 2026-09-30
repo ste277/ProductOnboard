@@ -103,6 +103,62 @@ test("extracts declarative sibling and nested routes with component provenance",
   });
 });
 
+test("extracts React Router 5 components, render callbacks, and exact custom wrappers", async () => {
+  const repository = await createRepository("react router five ");
+  await createFile(repository, "src/routes.tsx", [
+    'import DefaultPage from "./DefaultPage.js";',
+    'import { NamedPage, NamedPage as AliasedPage } from "./pages.js";',
+    "const SameFilePage = () => <main />;",
+    "export const AppRoutes = () => <>",
+    '  <Route path="/default" component={DefaultPage} />',
+    '  <Route path="/named" component={NamedPage} />',
+    '  <Route path="/aliased" component={AliasedPage} />',
+    '  <PrivateRoute path="/same" component={SameFilePage} />',
+    '  <PrivateRoute path="/render" render={(routeProps) => (<DefaultPage {...routeProps} />)} />',
+    '  <PublicRoute path="/block" render={() => { return <NamedPage />; }} />',
+    '  <PublicRoute path="/conditional" render={() => enabled ? <NamedPage /> : <DefaultPage />} />',
+    '  <Route path="/tree" render={() => <Provider><NamedPage /></Provider>} />',
+    '  <Route path="/host" render={() => <div />} />',
+    '  <Route path="/hoc" component={withAuth(DefaultPage)} />',
+    '  <Card path="/card" component={DefaultPage} />',
+    '  <Widget path="/widget" render={() => <DefaultPage />} />',
+    '  <PrivateThing path="/private-thing" component={DefaultPage} />',
+    "</>;",
+    "",
+  ].join("\n"));
+
+  const inventory = await scanRepository(repository);
+  const sources = await analyzeSources(inventory);
+  const ui = analyzeUiStructure(sources);
+  const before = JSON.stringify({ inventory, sources, ui });
+  const manifest = analyzeRoutesAndNavigation(inventory, sources, ui);
+
+  assert.equal(JSON.stringify({ inventory, sources, ui }), before);
+  assert.deepEqual(manifest.routes.map((route) => [
+    route.path.kind === "static" ? route.path.value : route.path.expression,
+    route.routeElement,
+    route.component,
+    route.componentIssue?.status,
+  ]), [
+    ["/default", "Route", "DefaultPage", undefined],
+    ["/named", "Route", "NamedPage", undefined],
+    ["/aliased", "Route", "AliasedPage", undefined],
+    ["/same", "PrivateRoute", "SameFilePage", undefined],
+    ["/render", "PrivateRoute", "DefaultPage", undefined],
+    ["/block", "PublicRoute", "NamedPage", undefined],
+    ["/conditional", "PublicRoute", undefined, "ambiguous"],
+    ["/tree", "Route", undefined, "ambiguous"],
+    ["/host", "Route", undefined, "unresolved"],
+    ["/hoc", "Route", undefined, "unresolved"],
+  ]);
+  assert.equal(manifest.routes.some((route) =>
+    route.path.kind === "static" && ["/card", "/widget", "/private-thing"].includes(route.path.value)), false);
+  assert.deepEqual(manifest.routes[4]?.componentLocation, {
+    path: "src/routes.tsx", startLine: 9, endLine: 9,
+  });
+  assert.doesNotThrow(() => JSON.stringify(manifest));
+});
+
 test("extracts static route-object arrays and nested children", async () => {
   const repository = await createRepository("object routes ");
   await createFile(

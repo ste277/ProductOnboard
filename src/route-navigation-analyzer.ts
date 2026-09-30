@@ -26,14 +26,26 @@ export interface DynamicRouteValue {
 
 export type RouteValue = StaticRouteValue | DynamicRouteValue;
 export type RouteSource = "declarative" | "object" | "file-system";
+export type RouteElement = "Route" | "PrivateRoute" | "PublicRoute";
+export type RouteComponentSource = "element" | "component" | "render";
+
+export interface RouteComponentIssue {
+  status: "unresolved" | "ambiguous";
+  expression: string;
+  reason: string;
+  location: SourceLocation;
+}
 
 export interface RouteRecord {
   source: RouteSource;
+  routeElement?: RouteElement;
   path: RouteValue;
   declaredPath: RouteValue;
   parent?: string;
   component?: string;
+  componentSource?: RouteComponentSource;
   componentLocation?: SourceLocation;
+  componentIssue?: RouteComponentIssue;
   location: SourceLocation;
 }
 
@@ -113,6 +125,7 @@ function readRouteTree(
   routes: RouteRecord[],
 ): void {
   const opening = ts.isJsxElement(node) ? node.openingElement : node;
+  const routeElement = getRouteElement(opening.tagName);
   const declaredPath = readJsxValue(
     opening.attributes.properties,
     "path",
@@ -129,14 +142,19 @@ function readRouteTree(
     );
     routes.push({
       source: "declarative",
+      ...(routeElement ? { routeElement } : {}),
       path: resolvedPath,
       declaredPath,
       ...(typeof parentPath === "string" ? { parent: parentPath } : {}),
-      ...(component
+      ...(component?.status === "resolved"
         ? {
             component: component.name,
+            componentSource: component.source,
             componentLocation: component.location,
           }
+        : {}),
+      ...(component?.status !== "resolved" && component
+        ? { componentIssue: component }
         : {}),
       location: getLocation(node, sourceFile, filePath),
     });
@@ -399,30 +417,129 @@ function readRouteComponent(
   properties: ts.NodeArray<ts.JsxAttributeLike>,
   sourceFile: ts.SourceFile,
   filePath: string,
-): { name: string; location: SourceLocation } | undefined {
-  const property = properties.find(
+): ({ status: "resolved"; name: string; source: RouteComponentSource; location: SourceLocation } | RouteComponentIssue) | undefined {
+  const elementProperty = properties.find(
     (candidate): candidate is ts.JsxAttribute =>
       ts.isJsxAttribute(candidate) &&
       candidate.name.getText(sourceFile) === "element",
   );
-  const expression = property?.initializer && ts.isJsxExpression(property.initializer)
+  const elementExpression = elementProperty?.initializer && ts.isJsxExpression(elementProperty.initializer)
+    ? elementProperty.initializer.expression
+    : undefined;
+  if (elementExpression) return readRenderedComponent(elementExpression, "element", sourceFile, filePath);
+
+  const componentProperty = findJsxAttribute(properties, "component", sourceFile);
+  const componentExpression = readJsxExpression(componentProperty);
+  if (componentExpression) {
+    const value = unwrapParentheses(componentExpression);
+    if (ts.isIdentifier(value)) {
+      return { status: "resolved", name: value.text, source: "component", location: getLocation(value, sourceFile, filePath) };
+    }
+    return {
+      status: "unresolved",
+      expression: value.getText(sourceFile),
+      reason: "Route component expression is not a direct identifier",
+      location: getLocation(value, sourceFile, filePath),
+    };
+  }
+
+  const renderProperty = findJsxAttribute(properties, "render", sourceFile);
+  const renderExpression = readJsxExpression(renderProperty);
+  if (!renderExpression) return undefined;
+  const callback = unwrapParentheses(renderExpression);
+  if (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) {
+    return {
+      status: "unresolved",
+      expression: callback.getText(sourceFile),
+      reason: "Route render prop is not an inline callback",
+      location: getLocation(callback, sourceFile, filePath),
+    };
+  }
+  const returned = readDirectReturn(callback.body);
+  if (!returned) {
+    return {
+      status: "unresolved",
+      expression: callback.getText(sourceFile),
+      reason: "Route render callback has no single direct JSX return",
+      location: getLocation(callback, sourceFile, filePath),
+    };
+  }
+  return readRenderedComponent(returned, "render", sourceFile, filePath);
+}
+
+function readRenderedComponent(
+  expression: ts.Expression,
+  source: RouteComponentSource,
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): { status: "resolved"; name: string; source: RouteComponentSource; location: SourceLocation } | RouteComponentIssue {
+  const value = unwrapParentheses(expression);
+  if (ts.isConditionalExpression(value)) {
+    return {
+      status: "ambiguous",
+      expression: value.getText(sourceFile),
+      reason: "Route render callback returns conditional components",
+      location: getLocation(value, sourceFile, filePath),
+    };
+  }
+  if (!ts.isJsxElement(value) && !ts.isJsxSelfClosingElement(value)) {
+    return {
+      status: "unresolved",
+      expression: value.getText(sourceFile),
+      reason: "Route render callback does not directly return one JSX component",
+      location: getLocation(value, sourceFile, filePath),
+    };
+  }
+  const tagName = ts.isJsxElement(value)
+    ? value.openingElement.tagName.getText(sourceFile)
+    : value.tagName.getText(sourceFile);
+  if (!isProductComponentName(tagName)) {
+    return {
+      status: "unresolved",
+      expression: value.getText(sourceFile),
+      reason: "Route render callback returns a host element",
+      location: getLocation(value, sourceFile, filePath),
+    };
+  }
+  if (ts.isJsxElement(value) && containsNestedJsxElement(value)) {
+    return {
+      status: "ambiguous",
+      expression: value.getText(sourceFile),
+      reason: "Route render callback returns a nested component tree",
+      location: getLocation(value, sourceFile, filePath),
+    };
+  }
+  return { status: "resolved", name: tagName, source, location: getLocation(value, sourceFile, filePath) };
+}
+
+function readDirectReturn(body: ts.ConciseBody): ts.Expression | undefined {
+  if (!ts.isBlock(body)) return body;
+  const returns = body.statements.filter(ts.isReturnStatement);
+  return returns.length === 1 && returns[0]?.expression ? returns[0].expression : undefined;
+}
+
+function findJsxAttribute(
+  properties: ts.NodeArray<ts.JsxAttributeLike>,
+  name: string,
+  sourceFile: ts.SourceFile,
+): ts.JsxAttribute | undefined {
+  return properties.find((candidate): candidate is ts.JsxAttribute =>
+    ts.isJsxAttribute(candidate) && candidate.name.getText(sourceFile) === name);
+}
+
+function readJsxExpression(property: ts.JsxAttribute | undefined): ts.Expression | undefined {
+  return property?.initializer && ts.isJsxExpression(property.initializer)
     ? property.initializer.expression
     : undefined;
-  if (!expression) return undefined;
-  const value = unwrapParentheses(expression);
-  if (ts.isJsxElement(value)) {
-    return {
-      name: value.openingElement.tagName.getText(sourceFile),
-      location: getLocation(value, sourceFile, filePath),
-    };
-  }
-  if (ts.isJsxSelfClosingElement(value)) {
-    return {
-      name: value.tagName.getText(sourceFile),
-      location: getLocation(value, sourceFile, filePath),
-    };
-  }
-  return undefined;
+}
+
+function containsNestedJsxElement(node: ts.JsxElement): boolean {
+  return node.children.some((child) => ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child));
+}
+
+function isProductComponentName(name: string): boolean {
+  const leaf = name.split(".").at(-1) ?? "";
+  return /^[A-Z]/.test(leaf);
 }
 
 function readObjectRouteComponent(
@@ -491,7 +608,14 @@ function isRouteElement(
   const tagName = ts.isJsxElement(node)
     ? node.openingElement.tagName
     : node.tagName;
-  return tagName.getText().split(".").at(-1) === "Route";
+  return getRouteElement(tagName) !== undefined;
+}
+
+function getRouteElement(tagName: ts.JsxTagNameExpression): RouteElement | undefined {
+  const name = tagName.getText().split(".").at(-1);
+  return name === "Route" || name === "PrivateRoute" || name === "PublicRoute"
+    ? name
+    : undefined;
 }
 
 function hasRouteAncestor(node: ts.Node): boolean {

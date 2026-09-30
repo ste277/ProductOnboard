@@ -179,10 +179,12 @@ export function buildProductEvidenceGraph(
     const id = ids.node("route", locationKey(route.location), `${route.source}:${label}`);
     addNode(graph, id, "route", label, route.location, "route-navigation", {
       source: route.source,
+      ...(route.routeElement ? { routeElement: route.routeElement } : {}),
       path: route.path,
       declaredPath: route.declaredPath,
       ...(route.parent ? { parent: route.parent } : {}),
       ...(route.component ? { component: route.component } : {}),
+      ...(route.componentSource ? { componentSource: route.componentSource } : {}),
     });
     if (route.path.kind === "static") {
       const matches = routeIdsByPath.get(route.path.value) ?? [];
@@ -221,6 +223,11 @@ export function buildProductEvidenceGraph(
             "Associated route component is not a same-file UI component", "route-navigation",
           route.componentLocation);
       }
+    }
+    if (route.componentIssue) {
+      addUnresolved(graph, ids, "ROUTE_RENDERS_COMPONENT", id,
+        route.componentIssue.expression, route.componentIssue.reason,
+        "route-navigation", route.componentIssue.location);
     }
   }
 

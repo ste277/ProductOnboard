@@ -7,6 +7,8 @@ import { analyzeActionBindings } from "../src/action-binding-analyzer.js";
 import { analyzeFunctionCalls } from "../src/function-call-analyzer.js";
 import { analyzeGraphqlOperations } from "../src/graphql-operation-analyzer.js";
 import { analyzeHttpRequests } from "../src/http-request-analyzer.js";
+import { buildFeatureModel } from "../src/feature-model.js";
+import { reconcileProductEvidence } from "../src/evidence-reconciliation.js";
 import {
   buildProductEvidenceGraph,
   getEvidenceNode,
@@ -17,6 +19,7 @@ import {
   type ProductEvidenceGraph,
 } from "../src/product-evidence-graph.js";
 import { scanRepository } from "../src/repository-scanner.js";
+import { resolveProjectSymbols } from "../src/project-symbol-resolver.js";
 import { analyzeRoutesAndNavigation } from "../src/route-navigation-analyzer.js";
 import { analyzeSources } from "../src/source-analyzer.js";
 import { analyzeUiStructure } from "../src/ui-structure-analyzer.js";
@@ -79,6 +82,51 @@ test("builds the proven route-to-HTTP-and-GraphQL acceptance trace", async () =>
   assert.deepEqual(trace.map((step) => step.depth), [...trace].map((step) => step.depth).sort((a, b) => a - b));
   assert.ok(graph.edges.every((edge) => edge.evidence.length > 0));
   assert.ok(graph.nodes.every((node) => node.evidence[0]?.strength === "direct"));
+});
+
+test("connects React Router 5 custom routes through imports and into the feature model", async () => {
+  const repository = await createRepository("router five graph ");
+  await createFile(repository, "src/TicketPage.tsx", [
+    'import { gql, useMutation } from "@apollo/client";',
+    "const SAVE = gql`mutation SaveTicket { saveTicket }`;",
+    "export default function TicketPage() {",
+    "  const [saveTicket] = useMutation(SAVE);",
+    "  function handleSave() { saveTicket(); }",
+    "  return <Button onClick={handleSave}>Save ticket</Button>;",
+    "}",
+    "",
+  ].join("\n"));
+  await createFile(repository, "src/App.tsx", [
+    'import TicketPage from "./TicketPage";',
+    "export function App() {",
+    "  return <>",
+    '    <PrivateRoute path="/tickets" component={TicketPage} />',
+    '    <Route path="/conditional" render={() => enabled ? <TicketPage /> : <OtherPage />} />',
+    "  </>;",
+    "}",
+    "",
+  ].join("\n"));
+
+  const graph = await analyzeRepository(repository);
+  const route = graph.nodes.find((node) => node.type === "route");
+  assert.equal(route?.data.routeElement, "PrivateRoute");
+  const routeEdge = graph.edges.find((edge) => edge.type === "ROUTE_RENDERS_COMPONENT");
+  assert.ok(routeEdge);
+  assert.equal(graph.nodes.find((node) => node.id === routeEdge.to)?.label, "TicketPage");
+  assert.ok(routeEdge.evidence.some((entry) => entry.source === "module-resolution"));
+  assert.ok(graph.unresolved.some((item) =>
+    item.relationship === "ROUTE_RENDERS_COMPONENT" &&
+    item.reason === "Route render callback returns conditional components"));
+  assert.ok(graph.edges.some((edge) => edge.type === "PERFORMS_GRAPHQL_EXECUTION"));
+
+  const runtimeDiscovery = emptyRuntime(repository);
+  const reconciliation = reconcileProductEvidence({ staticGraph: graph, runtimeDiscovery });
+  const model = buildFeatureModel({ staticGraph: graph, runtimeDiscovery, reconciliation });
+  const feature = model.features.find((entry) => entry.routes.some((item) => item.label === "/tickets"));
+  assert.ok(feature);
+  assert.ok(feature.ui.some((item) => item.label.includes("Save ticket")));
+  assert.ok(feature.actions.some((item) => item.label === "handleSave"));
+  assert.ok(feature.graphql.some((item) => item.label === "saveTicket"));
 });
 
 test("retains imported, member, props, imported-call, and dynamic-navigation gaps", async () => {
@@ -303,6 +351,7 @@ async function analyzeRepository(repository: string): Promise<ProductEvidenceGra
   const calls = analyzeFunctionCalls(sources);
   const http = analyzeHttpRequests(sources, calls);
   const graphql = analyzeGraphqlOperations(sources, calls);
+  const resolution = resolveProjectSymbols(inventory, sources, calls);
   return buildProductEvidenceGraph({
     inventory,
     sources,
@@ -312,7 +361,21 @@ async function analyzeRepository(repository: string): Promise<ProductEvidenceGra
     calls,
     http,
     graphql,
+    resolution,
   });
+}
+
+function emptyRuntime(root: string) {
+  return {
+    startUrl: `https://example.test/${encodeURIComponent(root)}`,
+    startOrigin: "https://example.test",
+    allowedOrigins: ["https://example.test"],
+    limits: { maxDepth: 0, maxStates: 0, maxTransitions: 0, maxTargetsPerState: 0 },
+    nodes: [], transitions: [], skippedTargets: [], stopReasons: ["completed" as const],
+    summary: { statesDiscovered: 0, transitionsObserved: 0, failedTransitions: 0,
+      targetsSkipped: 0, blocked: 0, unknown: 0, boundaryStates: 0,
+      mutationStopBranches: 0, maxDepthReached: 0 },
+  };
 }
 
 async function createRepository(prefix: string): Promise<string> {
