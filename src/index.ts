@@ -280,6 +280,31 @@ export {
 } from "./product-contract-evidence.js";
 
 export {
+  formatContractReconciliation,
+  getContractAmbiguous,
+  getContractConflicts,
+  getContractCorroborated,
+  getContractEvidenceForFeature,
+  getContractOnly,
+  getProductOnly,
+  reconcileProductContract,
+  validateContractReconciliation,
+  type ContractComparisonDimension,
+  type ContractDimensionResult,
+  type ContractEvidenceReference,
+  type ContractFeatureLink,
+  type ContractReconciliationCoverage,
+  type ContractReconciliationDomain,
+  type ContractReconciliationManifest,
+  type ContractReconciliationResult,
+  type ContractReconciliationStatus,
+  type ContractReconciliationStrength,
+  type ContractReconciliationSummary,
+  type ProductEvidenceReference,
+  type ReconcileProductContractInput,
+} from "./contract-reconciliation.js";
+
+export {
   AuthenticationSessionError,
   createAuthenticatedSession,
   type AuthenticationCredentials,
