@@ -252,6 +252,34 @@ export {
 } from "./feature-model.js";
 
 export {
+  formatProductContractEvidence,
+  getContractEndpoints,
+  getContractOperation,
+  getContractOperationsByType,
+  getContractType,
+  ingestApiDocumentation,
+  validateProductContractEvidence,
+  type ContractApiStyle,
+  type ContractArgument,
+  type ContractAuthenticationRequirement,
+  type ContractEndpoint,
+  type ContractExample,
+  type ContractOperation,
+  type ContractOperationType,
+  type ContractOperationVariant,
+  type ContractPaginationEvidence,
+  type ContractProvenance,
+  type ContractRetrievalMethod,
+  type ContractSourceManifest,
+  type ContractTypeDefinition,
+  type ContractTypeField,
+  type IngestApiDocumentationInput,
+  type ProductContractEvidence,
+  type SuppliedDocumentationInput,
+  type UnresolvedContractEvidence,
+} from "./product-contract-evidence.js";
+
+export {
   AuthenticationSessionError,
   createAuthenticatedSession,
   type AuthenticationCredentials,

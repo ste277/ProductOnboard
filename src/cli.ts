@@ -13,6 +13,7 @@ import { probeRuntimeNavigation } from "./navigation-probe.js";
 import { discoverRuntimeNavigation } from "./runtime-discovery.js";
 import { reconcileProductEvidence } from "./evidence-reconciliation.js";
 import { buildFeatureModel } from "./feature-model.js";
+import { ingestApiDocumentation } from "./product-contract-evidence.js";
 import type { ProductEvidenceGraph } from "./product-evidence-graph.js";
 import type { RuntimeNavigationDiscoveryGraph } from "./runtime-discovery.js";
 
@@ -57,6 +58,19 @@ if (!command) {
       const staticGraph = JSON.parse(await readFile(inputs.staticPath, "utf8")) as ProductEvidenceGraph;
       const runtimeDiscovery = JSON.parse(await readFile(inputs.runtimePath, "utf8")) as RuntimeNavigationDiscoveryGraph;
       console.log(JSON.stringify(reconcileProductEvidence({ staticGraph, runtimeDiscovery }), null, 2));
+    } catch (error) {
+      console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }, null, 2));
+      process.exitCode = 1;
+    }
+  }
+} else if (command === "contract") {
+  const url = process.argv[3];
+  if (!url || process.argv.length > 4) {
+    console.error("Usage: source-inventory contract <http(s)-url>");
+    process.exitCode = 1;
+  } else {
+    try {
+      console.log(JSON.stringify(await ingestApiDocumentation({ url }), null, 2));
     } catch (error) {
       console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }, null, 2));
       process.exitCode = 1;
