@@ -15,6 +15,7 @@ import { reconcileProductEvidence } from "./evidence-reconciliation.js";
 import { buildFeatureModel } from "./feature-model.js";
 import { ingestApiDocumentation } from "./product-contract-evidence.js";
 import { reconcileProductContract } from "./contract-reconciliation.js";
+import { buildKnowledgeEvidencePackage } from "./knowledge-base-generator.js";
 import type { ProductEvidenceGraph } from "./product-evidence-graph.js";
 import type { RuntimeNavigationDiscoveryGraph } from "./runtime-discovery.js";
 
@@ -59,6 +60,24 @@ if (!command) {
       const staticGraph = JSON.parse(await readFile(inputs.staticPath, "utf8")) as ProductEvidenceGraph;
       const runtimeDiscovery = JSON.parse(await readFile(inputs.runtimePath, "utf8")) as RuntimeNavigationDiscoveryGraph;
       console.log(JSON.stringify(reconcileProductEvidence({ staticGraph, runtimeDiscovery }), null, 2));
+    } catch (error) {
+      console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }, null, 2));
+      process.exitCode = 1;
+    }
+  }
+} else if (command === "kb-evidence") {
+  const inputs = readKnowledgeEvidenceFlags(process.argv.slice(3));
+  if (!inputs) {
+    console.error("Usage: source-inventory kb-evidence --feature <feature-id> --static <static-graph.json> --runtime <runtime-discovery.json> --reconciliation <reconciliation.json> --features <features.json> --contract <contract.json> --contract-reconciliation <contract-reconciliation.json>");
+    process.exitCode = 1;
+  } else {
+    try {
+      const [staticGraph, runtimeDiscovery, reconciliation, featureModel, contractEvidence, contractReconciliation] = await Promise.all([
+        inputs.staticPath, inputs.runtimePath, inputs.reconciliationPath, inputs.featuresPath, inputs.contractPath,
+        inputs.contractReconciliationPath,
+      ].map(async (file) => JSON.parse(await readFile(file, "utf8"))));
+      console.log(JSON.stringify(buildKnowledgeEvidencePackage({ featureId: inputs.featureId, staticGraph, runtimeDiscovery,
+        reconciliation, featureModel, contractEvidence, contractReconciliation }), null, 2));
     } catch (error) {
       console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }, null, 2));
       process.exitCode = 1;
@@ -249,6 +268,27 @@ function readContractReconcileFlags(arguments_: string[]): {
   }
   return result.contractPath && result.staticPath && result.runtimePath && result.reconciliationPath && result.featuresPath
     ? result as Required<typeof result> : undefined;
+}
+
+function readKnowledgeEvidenceFlags(arguments_: string[]): {
+  featureId: string; contractPath: string; staticPath: string; runtimePath: string; reconciliationPath: string;
+  featuresPath: string; contractReconciliationPath: string;
+} | undefined {
+  const result: Partial<{ featureId: string; contractPath: string; staticPath: string; runtimePath: string;
+    reconciliationPath: string; featuresPath: string; contractReconciliationPath: string }> = {};
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const flag = arguments_[index]; const value = arguments_[index + 1]; if (!value) return undefined;
+    if (flag === "--feature") result.featureId = value;
+    else if (flag === "--contract") result.contractPath = value;
+    else if (flag === "--static") result.staticPath = value;
+    else if (flag === "--runtime") result.runtimePath = value;
+    else if (flag === "--reconciliation") result.reconciliationPath = value;
+    else if (flag === "--features") result.featuresPath = value;
+    else if (flag === "--contract-reconciliation") result.contractReconciliationPath = value;
+    else return undefined;
+  }
+  return result.featureId && result.contractPath && result.staticPath && result.runtimePath && result.reconciliationPath &&
+    result.featuresPath && result.contractReconciliationPath ? result as Required<typeof result> : undefined;
 }
 
 function readDiscoveryFlags(arguments_: string[]): {
