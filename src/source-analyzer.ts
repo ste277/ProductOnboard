@@ -100,8 +100,21 @@ export async function analyzeSources(
   const files: SourceFileAnalysis[] = [];
 
   for (const file of sourceFiles) {
-    const sourceText = await readFile(path.join(inventory.root, file.path), "utf8");
-    files.push(analyzeSourceFile(file.path, file.extension, sourceText));
+    try {
+      const sourceText = await readFile(path.join(inventory.root, file.path), "utf8");
+      files.push(analyzeSourceFile(file.path, sourceText));
+    } catch (error) {
+      files.push({
+        path: file.path,
+        status: "parse-error",
+        errors: [{
+          code: 0,
+          message: error instanceof Error ? error.message : String(error),
+          line: 1,
+          column: 1,
+        }],
+      });
+    }
   }
 
   return { root: inventory.root, files };
@@ -109,11 +122,10 @@ export async function analyzeSources(
 
 function analyzeSourceFile(
   filePath: string,
-  extension: SourceExtension,
   sourceText: string,
 ): SourceFileAnalysis {
   const sourceFile = parseTypeScriptSource(filePath, sourceText);
-  const errors = getParseErrors(sourceFile, sourceText, extension);
+  const errors = getParseErrors(sourceFile);
 
   if (errors.length > 0) {
     return { path: filePath, status: "parse-error", errors };
@@ -133,7 +145,7 @@ function analyzeSourceFile(
 
     readExports(node, sourceFile, filePath, exports);
 
-    if (ts.isFunctionDeclaration(node) && node.name) {
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
       functions.push({
         name: node.name.text,
         async: hasModifier(node, ts.SyntaxKind.AsyncKeyword),
@@ -278,20 +290,14 @@ function readExports(
 
 function getParseErrors(
   sourceFile: ts.SourceFile,
-  sourceText: string,
-  extension: SourceExtension,
 ): ParseError[] {
-  const diagnostics = ts.transpileModule(sourceText, {
-    fileName: sourceFile.fileName,
-    reportDiagnostics: true,
-    compilerOptions: {
-      allowJs: extension === ".js" || extension === ".jsx",
-      jsx: ts.JsxEmit.Preserve,
-      target: ts.ScriptTarget.Latest,
-    },
-  }).diagnostics;
+  const diagnostics = (
+    sourceFile as ts.SourceFile & {
+      parseDiagnostics: readonly ts.DiagnosticWithLocation[];
+    }
+  ).parseDiagnostics;
 
-  return (diagnostics ?? [])
+  return diagnostics
     .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
     .map((diagnostic) => {
       const position = sourceFile.getLineAndCharacterOfPosition(

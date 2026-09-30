@@ -140,7 +140,7 @@ function collectCallables(
   };
 
   const visitDeclarations = (node: ts.Node): void => {
-    if (ts.isFunctionDeclaration(node)) {
+    if (ts.isFunctionDeclaration(node) && node.body) {
       add(
         node.name?.text ?? "<anonymous>",
         "function-declaration",
@@ -411,6 +411,7 @@ function isSuccessfulCodeFile(
 ): file is SuccessfulSourceAnalysis {
   const extension = path.extname(file.path).toLowerCase();
   return file.status === "ok" &&
+    !file.path.toLowerCase().endsWith(".d.ts") &&
     (extension === ".ts" ||
       extension === ".tsx" ||
       extension === ".js" ||
