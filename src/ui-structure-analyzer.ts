@@ -603,7 +603,8 @@ function isJsxSource(file: SourceAnalysisManifest["files"][number]):
   file is SuccessfulSourceAnalysis {
   return file.status === "ok" &&
     (path.extname(file.path).toLowerCase() === ".tsx" ||
-      path.extname(file.path).toLowerCase() === ".jsx") &&
+      path.extname(file.path).toLowerCase() === ".jsx" ||
+      path.extname(file.path).toLowerCase() === ".js") &&
     file.jsx.present;
 }
 

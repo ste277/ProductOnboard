@@ -218,7 +218,7 @@ test("classifies static and dynamic JSX props without evaluating expressions", a
   ]);
 });
 
-test("extracts multiple components from TSX and JSX while ignoring non-JSX files", async () => {
+test("extracts components from JSX-bearing TSX, JSX, and JS while ignoring non-JSX files", async () => {
   const repository = await createRepository("multiple components ");
   await createFile(
     repository,
@@ -239,6 +239,11 @@ test("extracts multiple components from TSX and JSX while ignoring non-JSX files
     "src/not-ui.ts",
     "export function calculate() { return 1; }\n",
   );
+  await createFile(
+    repository,
+    "src/Old.js",
+    "export function Old() { return <aside />; }\n",
+  );
 
   const ui = await analyzeRepository(repository);
 
@@ -246,6 +251,7 @@ test("extracts multiple components from TSX and JSX while ignoring non-JSX files
     "Legacy",
     "First",
     "Second",
+    "Old",
   ]);
 });
 
