@@ -130,6 +130,27 @@ test("ordinary, weak, and strong controls without navigation evidence remain unk
   }
 });
 
+test("allows strong structural custom navigation while preserving destructive safety", async () => {
+  const capture = await inventory();
+  const assets = capture.interactionCandidates.find((item) => item.text === "Assets");
+  const destructive = capture.interactionCandidates.find((item) => item.text === "Delete account");
+  assert.equal(assets?.navigation?.classification, "custom-navigation");
+  assert.ok(assets?.navigation?.evidence.includes("repeated-clickable-sibling-group"));
+  assert.ok(assets);
+  const result = await probe(assets.id, "custom-navigation");
+  assert.equal(result.safety.decision, "allowed");
+  assert.ok(result.safety.reasons.includes("structural-navigation-context"));
+  assert.equal(result.interaction.count, 1);
+  assert.equal(result.transition?.kind, "hash-change");
+  assert.match(result.after?.accessibility.snapshot ?? "", /heading "Assets"/);
+
+  assert.ok(destructive);
+  const blocked = await probe(destructive.id, "custom-navigation-destructive");
+  assert.equal(blocked.safety.decision, "blocked");
+  assert.equal(blocked.interaction.performed, false);
+  assert.equal(requests.some((item) => item.path === "/deleted-custom"), false);
+});
+
 test("captures a same-origin popup once without a second interaction", async () => {
   const result = await probe(await semanticId("Open Popup"), "popup");
   assert.equal(result.safety.decision, "allowed");
@@ -245,12 +266,23 @@ function probeFixture(): string {
     <div id="login" style="cursor:pointer">Login as requester</div>
     <div id="weak" style="cursor:pointer">Weak Card</div>
     <div id="strong">Strong Card</div>
+    <div id="product-nav">
+      <div id="assets" style="cursor:pointer">Assets</div>
+      <div id="tickets-custom" style="cursor:pointer">Tickets workspace</div>
+      <div id="delete-custom" style="cursor:pointer">Delete account</div>
+    </div>
     <script>
       document.querySelector('#login').addEventListener('click', () => {
         location.hash = '/login/requester';
         document.body.insertAdjacentHTML('beforeend', '<section><label>Username <input aria-label="Username"></label><label>Password <input type="password" aria-label="Password"></label><button>Sign In</button></section>');
       });
       document.querySelector('#strong').addEventListener('click', () => {});
+      document.querySelector('#assets').addEventListener('click', () => {
+        location.hash = '/assets';
+        document.body.insertAdjacentHTML('beforeend', '<section><h1>Assets</h1></section>');
+      });
+      document.querySelector('#tickets-custom').addEventListener('click', () => { location.hash = '/tickets'; });
+      document.querySelector('#delete-custom').addEventListener('click', () => fetch('/deleted-custom', { method: 'DELETE' }));
       document.querySelector('#details').addEventListener('click', () => {
         document.body.insertAdjacentHTML('beforeend', '<div role="dialog" aria-label="Details"><h2>Details</h2></div>');
       });

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import type {
@@ -14,6 +15,7 @@ import type {
 import { parseTypeScriptSource } from "./typescript-parser.js";
 
 const SUPPORTED_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"] as const;
+const SUPPORTED_COMPONENT_EXPORT_WRAPPERS = new Set(["withLDConsumer", "withRouter"]);
 
 export type SymbolResolutionStrength = "direct" | "re-exported";
 export type SymbolResolutionKind = "import" | "namespace-member";
@@ -26,10 +28,32 @@ export type SymbolResolutionFailureReason =
   | "circular-re-export"
   | "external-module"
   | "unsupported-module-alias"
+  | "configured-path-alias-target-not-found"
+  | "configured-path-alias-outside-repository"
+  | "workspace-package-target-not-found"
   | "dynamic-import-out-of-scope";
 
+export interface ConfiguredModuleResolution {
+  kind: "path-alias" | "base-url";
+  configPath: string;
+  aliasPattern?: string;
+  expandedTarget: string;
+}
+
+export interface WorkspaceModuleResolution {
+  packageName: string;
+  packageRoot: string;
+  manifestPath: string;
+  expandedTarget: string;
+}
+
+export interface ProjectConfigurationError {
+  path: string;
+  message: string;
+}
+
 export interface ModuleResolutionEvidence {
-  kind: "import" | "module" | "export" | "re-export" | "declaration" | "call";
+  kind: "import" | "module" | "export" | "re-export" | "declaration" | "call" | "configuration" | "path-alias" | "workspace-package";
   path: string;
   moduleSpecifier?: string;
   name?: string;
@@ -53,6 +77,8 @@ export interface SymbolResolution {
   target: ResolvedSymbolTarget;
   strength: SymbolResolutionStrength;
   evidence: ModuleResolutionEvidence[];
+  configuredModule?: ConfiguredModuleResolution;
+  workspaceModule?: WorkspaceModuleResolution;
   usageLocation?: SourceLocation;
 }
 
@@ -65,6 +91,8 @@ export interface UnresolvedSymbolResolution {
   reason: SymbolResolutionFailureReason;
   candidates?: string[];
   evidence: ModuleResolutionEvidence[];
+  configuredModule?: ConfiguredModuleResolution;
+  workspaceModule?: WorkspaceModuleResolution;
   usageLocation?: SourceLocation;
 }
 
@@ -77,6 +105,14 @@ export interface ProjectSymbolResolutionManifest {
   modules: ProjectModuleRecord[];
   resolutions: SymbolResolution[];
   unresolved: UnresolvedSymbolResolution[];
+  configurationErrors: ProjectConfigurationError[];
+}
+
+interface ProjectConfiguration {
+  path: string;
+  directory: string;
+  baseUrl?: string;
+  paths: Array<{ pattern: string; targets: string[] }>;
 }
 
 interface ImportRequest {
@@ -128,6 +164,30 @@ interface FailedExport {
 }
 
 type ExportResult = ResolvedExport | FailedExport;
+type ModuleResult = { kind: "resolved"; path: string } | {
+  kind: "failed";
+  reason: "module-not-found" | "ambiguous-module";
+  candidates?: string[];
+};
+
+interface ConfiguredModuleResult {
+  moduleResult: ModuleResult;
+  metadata: ConfiguredModuleResolution;
+  failureReason?: "configured-path-alias-target-not-found" | "configured-path-alias-outside-repository";
+}
+
+interface WorkspacePackage {
+  name: string;
+  root: string;
+  manifestPath: string;
+  entryPoints: string[];
+}
+
+interface WorkspaceModuleResult {
+  moduleResult: ModuleResult;
+  metadata: WorkspaceModuleResolution;
+  alternativeMetadata?: WorkspaceModuleResolution[];
+}
 
 export function resolveProjectSymbols(
   inventory: RepositoryInventory,
@@ -146,6 +206,8 @@ export function resolveProjectSymbols(
       .filter((file) => isSupportedPath(file.path))
       .map((file) => normalizePath(file.path)),
   );
+  const { configurations, errors: configurationErrors } = loadProjectConfigurations(inventory);
+  const workspacePackages = loadWorkspacePackages(inventory);
   const symbols = new Map<string, FileSymbols>();
   const imports: ImportRequest[] = [];
   const namespaces: NamespaceImport[] = [];
@@ -163,7 +225,8 @@ export function resolveProjectSymbols(
   const exportCache = new Map<string, ExportResult>();
 
   for (const request of imports) {
-    resolveRequest(request, projectFiles, symbols, callables, exportCache, resolutions, unresolved);
+    resolveRequest(request, projectFiles, symbols, callables, exportCache, resolutions, unresolved, configurations,
+      workspacePackages);
   }
 
   for (const namespace of namespaces) {
@@ -186,6 +249,8 @@ export function resolveProjectSymbols(
           exportCache,
           resolutions,
           unresolved,
+          configurations,
+          workspacePackages,
           call.location,
           "namespace-member",
         );
@@ -200,6 +265,7 @@ export function resolveProjectSymbols(
     modules: [...projectFiles].sort(compareText).map((modulePath) => ({ path: modulePath })),
     resolutions,
     unresolved,
+    configurationErrors,
   };
 }
 
@@ -211,6 +277,8 @@ function resolveRequest(
   cache: Map<string, ExportResult>,
   resolutions: SymbolResolution[],
   unresolved: UnresolvedSymbolResolution[],
+  configurations: ProjectConfiguration[],
+  workspacePackages: WorkspacePackage[],
   usageLocation?: SourceLocation,
   kind: SymbolResolutionKind = "import",
 ): void {
@@ -226,7 +294,13 @@ function resolveRequest(
   }
 
   const classification = classifyModuleSpecifier(request.moduleSpecifier);
-  if (classification !== "relative") {
+  const configured = classification === "relative"
+    ? undefined
+    : resolveConfiguredModule(request.importingFile, request.moduleSpecifier, projectFiles, configurations);
+  const workspace = classification === "relative" || configured?.moduleResult.kind === "resolved"
+    ? undefined
+    : resolveWorkspaceModule(request.moduleSpecifier, projectFiles, workspacePackages);
+  if (classification !== "relative" && !configured && !workspace) {
     unresolved.push({
       kind,
       importingFile: request.importingFile,
@@ -240,11 +314,11 @@ function resolveRequest(
     return;
   }
 
-  const moduleResult = resolveModulePath(
-    request.importingFile,
-    request.moduleSpecifier,
-    projectFiles,
-  );
+  const moduleResult = configured?.moduleResult.kind === "resolved"
+    ? configured.moduleResult
+    : workspace?.moduleResult ?? configured?.moduleResult ?? resolveModulePath(
+    request.importingFile, request.moduleSpecifier, projectFiles);
+  const configuredUsed = configured?.moduleResult.kind === "resolved" ? configured : undefined;
   if (moduleResult.kind === "failed") {
     unresolved.push({
       kind,
@@ -252,9 +326,16 @@ function resolveRequest(
       moduleSpecifier: request.moduleSpecifier,
       localName: request.localName,
       importedName: request.importedName,
-      reason: moduleResult.reason,
+      reason: workspace
+        ? moduleResult.reason === "ambiguous-module"
+          ? "ambiguous-module"
+          : "workspace-package-target-not-found"
+        : configured?.failureReason ?? moduleResult.reason,
       ...(moduleResult.candidates ? { candidates: moduleResult.candidates } : {}),
-      evidence: baseEvidence,
+      evidence: [...baseEvidence, ...(configuredUsed ? configuredEvidence(configuredUsed.metadata) : []),
+        ...(workspace ? workspaceEvidence(workspace.metadata, workspace.alternativeMetadata) : [])],
+      ...(configuredUsed ? { configuredModule: configuredUsed.metadata } : {}),
+      ...(workspace ? { workspaceModule: workspace.metadata } : {}),
       ...(usageLocation ? { usageLocation } : {}),
     });
     return;
@@ -278,12 +359,15 @@ function resolveRequest(
       importedName: request.importedName,
       reason: result.reason,
       ...(result.candidates ? { candidates: result.candidates } : {}),
-      evidence: [...baseEvidence, {
+      evidence: [...baseEvidence, ...(configuredUsed ? configuredEvidence(configuredUsed.metadata) : []),
+        ...(workspace ? workspaceEvidence(workspace.metadata, workspace.alternativeMetadata) : []), {
         kind: "module",
         path: moduleResult.path,
         moduleSpecifier: request.moduleSpecifier,
       }, ...result.evidence],
       ...(usageLocation ? { usageLocation } : {}),
+      ...(configuredUsed ? { configuredModule: configuredUsed.metadata } : {}),
+      ...(workspace ? { workspaceModule: workspace.metadata } : {}),
     });
     return;
   }
@@ -297,12 +381,15 @@ function resolveRequest(
     importedName: request.importedName,
     target: result.target,
     strength: result.reExported ? "re-exported" : "direct",
-    evidence: [...baseEvidence, {
+    evidence: [...baseEvidence, ...(configuredUsed ? configuredEvidence(configuredUsed.metadata) : []),
+      ...(workspace ? workspaceEvidence(workspace.metadata, workspace.alternativeMetadata) : []), {
       kind: "module",
       path: moduleResult.path,
       moduleSpecifier: request.moduleSpecifier,
     }, ...result.evidence],
     ...(usageLocation ? { usageLocation } : {}),
+    ...(configuredUsed ? { configuredModule: configuredUsed.metadata } : {}),
+    ...(workspace ? { workspaceModule: workspace.metadata } : {}),
   });
 }
 
@@ -478,7 +565,7 @@ function readFileSymbols(
 
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
       const expression = unwrapParentheses(statement.expression);
-      const localName = ts.isIdentifier(expression) ? expression.text : undefined;
+      const localName = readSupportedComponentExportIdentifier(expression);
       const declaration = localName ? findDeclaration({ declarations, exports }, localName) : undefined;
       exports.push({
         exportedName: "default",
@@ -495,6 +582,25 @@ function readFileSymbols(
     }
   }
   return { declarations, exports };
+}
+
+function readSupportedComponentExportIdentifier(expression: ts.Expression): string | undefined {
+  const current = unwrapParentheses(expression);
+  if (ts.isIdentifier(current)) return current.text;
+  if (!ts.isCallExpression(current) || current.arguments.length !== 1) return undefined;
+  const wrapper = readWrapperName(current.expression);
+  if (!wrapper || !SUPPORTED_COMPONENT_EXPORT_WRAPPERS.has(wrapper)) return undefined;
+  return readSupportedComponentExportIdentifier(current.arguments[0]!);
+}
+
+function readWrapperName(expression: ts.Expression): string | undefined {
+  const current = unwrapParentheses(expression);
+  if (ts.isIdentifier(current)) return current.text;
+  if (ts.isCallExpression(current)) {
+    const callee = unwrapParentheses(current.expression);
+    if (ts.isIdentifier(callee)) return callee.text;
+  }
+  return undefined;
 }
 
 function readImports(
@@ -562,12 +668,12 @@ function resolveModulePath(
   importingFile: string,
   moduleSpecifier: string,
   projectFiles: Set<string>,
-): { kind: "resolved"; path: string } | {
-  kind: "failed";
-  reason: "module-not-found" | "ambiguous-module";
-  candidates?: string[];
-} {
+): ModuleResult {
   const base = normalizePath(path.posix.join(path.posix.dirname(importingFile), moduleSpecifier));
+  return resolveModuleBase(base, projectFiles);
+}
+
+function resolveModuleBase(base: string, projectFiles: Set<string>): ModuleResult {
   const extension = path.posix.extname(base);
   const candidates = extension && SUPPORTED_EXTENSIONS.includes(extension as typeof SUPPORTED_EXTENSIONS[number])
     ? [base]
@@ -581,12 +687,357 @@ function resolveModulePath(
   return { kind: "failed", reason: "module-not-found" };
 }
 
+function resolveConfiguredModule(
+  importingFile: string,
+  moduleSpecifier: string,
+  projectFiles: Set<string>,
+  configurations: ProjectConfiguration[],
+): ConfiguredModuleResult | undefined {
+  const applicable = configurations
+    .filter((config) => isWithinDirectory(importingFile, config.directory))
+    .sort((left, right) => {
+      const depth = pathDepth(right.directory) - pathDepth(left.directory);
+      return depth || compareText(left.path, right.path);
+    });
+
+  for (const config of applicable) {
+    const mapping = selectPathMapping(moduleSpecifier, config.paths);
+    if (mapping) {
+      const wildcard = matchPathPattern(moduleSpecifier, mapping.pattern);
+      if (wildcard === undefined) continue;
+      let firstMetadata: ConfiguredModuleResolution | undefined;
+      for (const target of mapping.targets) {
+        const substituted = target.includes("*") ? target.replace("*", wildcard) : target;
+        const expandedTarget = normalizePath(path.posix.join(config.baseUrl ?? config.directory, substituted));
+        const metadata: ConfiguredModuleResolution = {
+          kind: "path-alias",
+          configPath: config.path,
+          aliasPattern: mapping.pattern,
+          expandedTarget,
+        };
+        firstMetadata ??= metadata;
+        if (!isRepositoryPath(expandedTarget)) {
+          return {
+            moduleResult: { kind: "failed", reason: "module-not-found" },
+            metadata,
+            failureReason: "configured-path-alias-outside-repository",
+          };
+        }
+        const result = resolveModuleBase(expandedTarget, projectFiles);
+        if (result.kind === "resolved" || result.reason === "ambiguous-module") {
+          return { moduleResult: result, metadata };
+        }
+      }
+      return {
+        moduleResult: { kind: "failed", reason: "module-not-found" },
+        metadata: firstMetadata!,
+        failureReason: "configured-path-alias-target-not-found",
+      };
+    }
+
+    if (config.baseUrl) {
+      const expandedTarget = normalizePath(path.posix.join(config.baseUrl, moduleSpecifier));
+      if (!isRepositoryPath(expandedTarget)) continue;
+      const result = resolveModuleBase(expandedTarget, projectFiles);
+      if (result.kind === "resolved" || result.reason === "ambiguous-module") {
+        return {
+          moduleResult: result,
+          metadata: { kind: "base-url", configPath: config.path, expandedTarget },
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+function resolveWorkspaceModule(
+  moduleSpecifier: string,
+  projectFiles: Set<string>,
+  packages: WorkspacePackage[],
+): WorkspaceModuleResult | undefined {
+  const matches = packages.filter((item) =>
+    moduleSpecifier === item.name || moduleSpecifier.startsWith(`${item.name}/`));
+  if (matches.length === 0) return undefined;
+
+  const longestName = Math.max(...matches.map((item) => item.name.length));
+  const candidates = matches.filter((item) => item.name.length === longestName);
+  if (candidates.length > 1) {
+    const metadata = candidates.map((item): WorkspaceModuleResolution => ({
+      packageName: item.name,
+      packageRoot: item.root,
+      manifestPath: item.manifestPath,
+      expandedTarget: item.root,
+    }));
+    return {
+      moduleResult: {
+        kind: "failed",
+        reason: "ambiguous-module",
+        candidates: candidates.map((item) => item.manifestPath).sort(compareText),
+      },
+      metadata: metadata[0]!,
+      alternativeMetadata: metadata.slice(1),
+    };
+  }
+  const workspacePackage = candidates[0]!;
+  const subpath = moduleSpecifier === workspacePackage.name
+    ? ""
+    : moduleSpecifier.slice(workspacePackage.name.length + 1);
+  const bases = subpath
+    ? [normalizePath(path.posix.join(workspacePackage.root, subpath))]
+    : workspacePackage.entryPoints.length > 0
+      ? workspacePackage.entryPoints.map((entry) => normalizePath(path.posix.join(workspacePackage.root, entry)))
+      : [workspacePackage.root];
+  const results = bases.map((base) => ({ base, result: resolveModuleBase(base, projectFiles) }));
+  const resolved = results.filter((item) => item.result.kind === "resolved");
+  const expandedTarget = resolved[0]?.base ?? bases[0]!;
+  const metadata: WorkspaceModuleResolution = {
+    packageName: workspacePackage.name,
+    packageRoot: workspacePackage.root,
+    manifestPath: workspacePackage.manifestPath,
+    expandedTarget,
+  };
+  if (resolved.length === 1) return { moduleResult: resolved[0]!.result, metadata };
+  if (resolved.length > 1) {
+    return {
+      moduleResult: {
+        kind: "failed",
+        reason: "ambiguous-module",
+        candidates: resolved.map((item) => (item.result as { kind: "resolved"; path: string }).path)
+          .sort(compareText),
+      },
+      metadata,
+    };
+  }
+  const ambiguous = results.find((item) =>
+    item.result.kind === "failed" && item.result.reason === "ambiguous-module");
+  return { moduleResult: ambiguous?.result ?? { kind: "failed", reason: "module-not-found" }, metadata };
+}
+
+function selectPathMapping(
+  specifier: string,
+  mappings: ProjectConfiguration["paths"],
+): ProjectConfiguration["paths"][number] | undefined {
+  return mappings
+    .filter((mapping) => matchPathPattern(specifier, mapping.pattern) !== undefined)
+    .sort((left, right) => {
+      const leftExact = left.pattern.includes("*") ? 0 : 1;
+      const rightExact = right.pattern.includes("*") ? 0 : 1;
+      return rightExact - leftExact || pathPatternPrefix(right.pattern).length - pathPatternPrefix(left.pattern).length ||
+        compareText(left.pattern, right.pattern);
+    })[0];
+}
+
+function matchPathPattern(specifier: string, pattern: string): string | undefined {
+  const star = pattern.indexOf("*");
+  if (star < 0) return specifier === pattern ? "" : undefined;
+  if (pattern.indexOf("*", star + 1) >= 0) return undefined;
+  const prefix = pattern.slice(0, star);
+  const suffix = pattern.slice(star + 1);
+  return specifier.startsWith(prefix) && specifier.endsWith(suffix)
+    ? specifier.slice(prefix.length, specifier.length - suffix.length)
+    : undefined;
+}
+
+function pathPatternPrefix(pattern: string): string {
+  const star = pattern.indexOf("*");
+  return star < 0 ? pattern : pattern.slice(0, star);
+}
+
+function configuredEvidence(metadata: ConfiguredModuleResolution): ModuleResolutionEvidence[] {
+  return [
+    { kind: "configuration", path: metadata.configPath },
+    {
+      kind: "path-alias",
+      path: metadata.expandedTarget,
+      ...(metadata.aliasPattern ? { moduleSpecifier: metadata.aliasPattern } : {}),
+      name: metadata.kind,
+    },
+  ];
+}
+
+function workspaceEvidence(
+  metadata: WorkspaceModuleResolution,
+  alternatives: WorkspaceModuleResolution[] = [],
+): ModuleResolutionEvidence[] {
+  return [metadata, ...alternatives].flatMap((item) => [
+    { kind: "configuration" as const, path: item.manifestPath },
+    {
+      kind: "workspace-package" as const,
+      path: item.expandedTarget,
+      moduleSpecifier: item.packageName,
+      name: item.packageRoot,
+    },
+  ]);
+}
+
 function classifyModuleSpecifier(
   specifier: string,
 ): "relative" | "external-module" | "unsupported-module-alias" {
   if (specifier.startsWith("./") || specifier.startsWith("../")) return "relative";
   if (specifier.startsWith("@/") || specifier.startsWith("~/")) return "unsupported-module-alias";
   return "external-module";
+}
+
+function loadProjectConfigurations(inventory: RepositoryInventory): {
+  configurations: ProjectConfiguration[];
+  errors: ProjectConfigurationError[];
+} {
+  const configPaths = new Set(inventory.files
+    .map((file) => normalizePath(file.path))
+    .filter((filePath) => /(?:^|\/)(?:tsconfig|jsconfig)\.json$/.test(filePath)));
+  const cache = new Map<string, ProjectConfiguration>();
+  const errors: ProjectConfigurationError[] = [];
+  const loading = new Set<string>();
+
+  const load = (configPath: string): ProjectConfiguration | undefined => {
+    const cached = cache.get(configPath);
+    if (cached) return cached;
+    if (loading.has(configPath)) {
+      errors.push({ path: configPath, message: "Circular configuration extends chain" });
+      return undefined;
+    }
+    loading.add(configPath);
+    let parsed: Record<string, unknown>;
+    try {
+      const absolutePath = path.join(inventory.root, ...configPath.split("/"));
+      const result = ts.parseConfigFileTextToJson(configPath, readFileSync(absolutePath, "utf8"));
+      if (result.error || !result.config || typeof result.config !== "object") {
+        const message = result.error
+          ? ts.flattenDiagnosticMessageText(result.error.messageText, "\n")
+          : "Configuration must contain a JSON object";
+        errors.push({ path: configPath, message });
+        loading.delete(configPath);
+        return undefined;
+      }
+      parsed = result.config as Record<string, unknown>;
+    } catch (error) {
+      errors.push({ path: configPath, message: error instanceof Error ? error.message : String(error) });
+      loading.delete(configPath);
+      return undefined;
+    }
+
+    const directory = normalizeDirectory(path.posix.dirname(configPath));
+    const extendsValue = typeof parsed.extends === "string" ? parsed.extends : undefined;
+    const parentPath = extendsValue ? resolveExtendedConfig(directory, extendsValue, configPaths) : undefined;
+    const parent = parentPath ? load(parentPath) : undefined;
+    if (extendsValue && !parentPath) {
+      errors.push({ path: configPath, message: `Unsupported or missing extends target: ${extendsValue}` });
+    }
+    const compilerOptions = parsed.compilerOptions && typeof parsed.compilerOptions === "object"
+      ? parsed.compilerOptions as Record<string, unknown>
+      : {};
+    const ownBaseUrl = typeof compilerOptions.baseUrl === "string"
+      ? normalizePath(path.posix.join(directory, compilerOptions.baseUrl))
+      : undefined;
+    const ownPaths = readConfiguredPaths(compilerOptions.paths);
+    const configuration: ProjectConfiguration = {
+      path: configPath,
+      directory,
+      ...(ownBaseUrl !== undefined
+        ? { baseUrl: ownBaseUrl }
+        : parent?.baseUrl ? { baseUrl: parent.baseUrl } : {}),
+      paths: ownPaths ?? parent?.paths ?? [],
+    };
+    cache.set(configPath, configuration);
+    loading.delete(configPath);
+    return configuration;
+  };
+
+  for (const configPath of [...configPaths].sort(compareText)) load(configPath);
+  return {
+    configurations: [...cache.values()].sort((left, right) => compareText(left.path, right.path)),
+    errors: errors.sort((left, right) => compareText(`${left.path}:${left.message}`, `${right.path}:${right.message}`)),
+  };
+}
+
+function loadWorkspacePackages(inventory: RepositoryInventory): WorkspacePackage[] {
+  const manifestPaths = inventory.files
+    .map((file) => normalizePath(file.path))
+    .filter((filePath) => /(?:^|\/)package\.json$/.test(filePath))
+    .sort(compareText);
+  const manifests = new Map<string, Record<string, unknown>>();
+  for (const manifestPath of manifestPaths) {
+    try {
+      const parsed = JSON.parse(readFileSync(path.join(inventory.root, ...manifestPath.split("/")), "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        manifests.set(manifestPath, parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Malformed package metadata cannot prove workspace membership.
+    }
+  }
+
+  const packages: WorkspacePackage[] = [];
+  for (const [rootManifestPath, rootManifest] of manifests) {
+    const rootDirectory = normalizeDirectory(path.posix.dirname(rootManifestPath));
+    const patterns = readWorkspacePatterns(rootManifest.workspaces);
+    if (patterns.length === 0) continue;
+    for (const [manifestPath, manifest] of manifests) {
+      if (manifestPath === rootManifestPath) continue;
+      const packageRoot = normalizeDirectory(path.posix.dirname(manifestPath));
+      const relativeRoot = normalizePath(path.posix.relative(rootDirectory || ".", packageRoot));
+      const name = typeof manifest.name === "string" ? manifest.name : undefined;
+      if (!name || !patterns.some((pattern) => workspacePatternMatches(pattern, relativeRoot))) continue;
+      const entryPoints = [manifest.types, manifest.module, manifest.main]
+        .filter((entry): entry is string => typeof entry === "string");
+      packages.push({ name, root: packageRoot, manifestPath, entryPoints });
+    }
+  }
+  return packages.sort((left, right) =>
+    compareText(`${left.name}:${left.manifestPath}`, `${right.name}:${right.manifestPath}`));
+}
+
+function readWorkspacePatterns(value: unknown): string[] {
+  const patterns = Array.isArray(value)
+    ? value
+    : value && typeof value === "object" && Array.isArray((value as { packages?: unknown }).packages)
+      ? (value as { packages: unknown[] }).packages
+      : [];
+  return patterns.filter((item): item is string => typeof item === "string")
+    .map((item) => normalizePath(item.replace(/\/$/, "")));
+}
+
+function workspacePatternMatches(pattern: string, packageRoot: string): boolean {
+  const expression = pattern.split("*").map(escapeRegExp).join("[^/]*");
+  return new RegExp(`^${expression}$`).test(packageRoot);
+}
+
+function readConfiguredPaths(value: unknown): ProjectConfiguration["paths"] | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value as Record<string, unknown>)
+    .filter((entry): entry is [string, string[]] =>
+      Array.isArray(entry[1]) && entry[1].every((target) => typeof target === "string"))
+    .map(([pattern, targets]) => ({ pattern, targets: [...targets] }));
+}
+
+function resolveExtendedConfig(
+  directory: string,
+  extendsValue: string,
+  configPaths: Set<string>,
+): string | undefined {
+  if (!extendsValue.startsWith(".")) return undefined;
+  const candidate = normalizePath(path.posix.join(directory, extendsValue));
+  for (const item of [candidate, `${candidate}.json`]) {
+    if (isRepositoryPath(item) && configPaths.has(item)) return item;
+  }
+  return undefined;
+}
+
+function isWithinDirectory(filePath: string, directory: string): boolean {
+  return directory === "" || filePath === directory || filePath.startsWith(`${directory}/`);
+}
+
+function normalizeDirectory(directory: string): string {
+  return directory === "." ? "" : normalizePath(directory);
+}
+
+function pathDepth(value: string): number {
+  return value === "" ? 0 : value.split("/").length;
+}
+
+function isRepositoryPath(value: string): boolean {
+  return value !== ".." && !value.startsWith("../") && !path.posix.isAbsolute(value);
 }
 
 function targetForDeclaration(

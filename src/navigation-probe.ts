@@ -259,6 +259,15 @@ export function classifyRuntimeProbeTarget(
   }
 
   const strong = target.source === "interaction-candidate" && target.strength === "strong";
+  const customNavigation = target.source === "interaction-candidate" &&
+    target.navigation?.classification === "custom-navigation" &&
+    target.navigation.evidence.includes("strong-click-evidence") &&
+    target.navigation.evidence.some((item) =>
+      ["navigation-context", "menu-context", "repeated-clickable-sibling-group"].includes(item));
+  if (strong && customNavigation && !context.insideForm && !context.associatedForm) {
+    return decision("allowed", ["strong-interaction-evidence", "structural-navigation-context",
+      "no-destructive-signal", "not-form-submit"]);
+  }
   const authEntry = AUTH_ENTRY_TERMS.some((term) => containsTerm(evidence, term));
   if (strong && authEntry && !context.insideForm && !context.associatedForm) {
     return decision("allowed", ["strong-interaction-evidence", "authentication-entry",

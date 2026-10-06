@@ -129,6 +129,64 @@ test("connects React Router 5 custom routes through imports and into the feature
   assert.ok(feature.graphql.some((item) => item.label === "saveTicket"));
 });
 
+test("builds deterministic direct component render containment without transitive guesses", async () => {
+  const repository = await createRepository("component renders ");
+  await Promise.all([
+    createFile(repository, "package.json", JSON.stringify({ workspaces: ["packages/*"] })),
+    createFile(repository, "packages/ui/package.json", JSON.stringify({ name: "@scope/ui" })),
+    createFile(repository, "packages/ui/WorkspaceChild.tsx",
+      "export default function WorkspaceChild() { return <button>Workspace</button>; }\n"),
+    createFile(repository, "src/ImportedChild.tsx",
+      "export function ImportedChild() { return <button>Imported</button>; }\n"),
+    createFile(repository, "src/reexport.ts", 'export { ImportedChild as ReexportedChild } from "./ImportedChild";\n'),
+    createFile(repository, "src/App.tsx", [
+      'import { ImportedChild } from "./ImportedChild";',
+      'import { ReexportedChild } from "./reexport";',
+      'import WorkspaceChild from "@scope/ui/WorkspaceChild";',
+      "function LocalChild() { return <ImportedChild />; }",
+      "function Parent({ enabled, Page, Pages }) {",
+      "  function unused() { return <UnusedChild />; }",
+      "  const handler = () => <EventOnlyChild />;",
+      "  if (!enabled) return <LocalChild />;",
+      "  return <section><ImportedChild /><ReexportedChild />",
+      "    <WorkspaceChild />{enabled && <LocalChild />}{enabled ? <ImportedChild /> : <WorkspaceChild />}",
+      "    <Page /><Pages.Member /><button onClick={handler}>Host</button></section>;",
+      "}",
+      "export function App() { return <Route path=\"/parent\" component={Parent} />; }",
+      "",
+    ].join("\n")),
+  ]);
+
+  const graph = await analyzeRepository(repository);
+  const components = new Map(graph.nodes.filter((node) => node.type === "component").map((node) => [node.label, node]));
+  const renderEdges = graph.edges.filter((edge) => edge.type === "COMPONENT_RENDERS_COMPONENT");
+  const parentEdges = renderEdges.filter((edge) => edge.from === components.get("Parent")?.id);
+  assert.deepEqual(parentEdges.map((edge) => graph.nodes.find((node) => node.id === edge.to)?.label).sort(),
+    ["ImportedChild", "LocalChild", "WorkspaceChild"]);
+  assert.ok(parentEdges.some((edge) => edge.evidence.some((item) => item.details?.renderKind === "conditional")));
+  assert.ok(parentEdges.some((edge) => edge.evidence.some((item) => item.details?.kind === "workspace-package")));
+  assert.ok(renderEdges.some((edge) => edge.from === components.get("LocalChild")?.id &&
+    edge.to === components.get("ImportedChild")?.id));
+  assert.equal(renderEdges.some((edge) => edge.from === components.get("Parent")?.id &&
+    edge.to === components.get("ImportedChild")?.id && edge.id.includes("LocalChild")), false);
+  assert.ok(graph.unresolved.some((item) => item.relationship === "COMPONENT_RENDERS_COMPONENT" && item.reference === "Page"));
+  assert.ok(graph.unresolved.some((item) => item.relationship === "COMPONENT_RENDERS_COMPONENT" && item.reference === "Pages.Member"));
+  assert.equal(graph.unresolved.some((item) => ["UnusedChild", "EventOnlyChild"].includes(item.reference)), false);
+});
+
+test("component render cycles remain direct and graph traversal terminates", async () => {
+  const graph = await graphFor(["src/cycle.tsx", [
+    "export function A() { return <B />; }",
+    "export function B() { return <A />; }",
+    "",
+  ].join("\n")]);
+  const edges = graph.edges.filter((edge) => edge.type === "COMPONENT_RENDERS_COMPONENT");
+  assert.equal(edges.length, 2);
+  const a = graph.nodes.find((node) => node.type === "component" && node.label === "A");
+  assert.ok(a);
+  assert.equal(traceEvidence(graph, a.id).filter((step) => step.node.type === "component").length, 2);
+});
+
 test("retains imported, member, props, imported-call, and dynamic-navigation gaps", async () => {
   const graph = await graphFor([
     "src/gaps.tsx",

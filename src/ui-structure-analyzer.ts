@@ -9,6 +9,14 @@ import { parseTypeScriptSource } from "./typescript-parser.js";
 
 export type ComponentExportStatus = "default" | "named" | "both" | "none";
 export type StaticPropValueType = "string" | "boolean" | "number" | "null";
+export type ComponentRenderKind = "direct" | "conditional";
+
+export interface RenderedComponentReference {
+  expression: string;
+  localName: string;
+  kind: ComponentRenderKind;
+  location: SourceLocation;
+}
 
 export interface StaticUiProp {
   name: string;
@@ -63,6 +71,7 @@ export interface UiComponent {
   exportStatus: ComponentExportStatus;
   location: SourceLocation;
   root: UiElementNode | UiFragmentNode;
+  renderedComponents?: RenderedComponentReference[];
 }
 
 export interface UiStructureManifest {
@@ -107,10 +116,116 @@ function analyzeUiSourceFile(file: SuccessfulSourceAnalysis): UiComponent[] {
         : getExportStatus(exportStatuses.get(candidate.name)),
       location: getLocation(candidate.declaration, sourceFile, file.path),
       root: readJsxRoot(returnedJsx, sourceFile, file.path),
+      renderedComponents: collectRenderedComponents(candidate.functionLike, sourceFile, file.path),
     });
   }
 
   return components;
+}
+
+function collectRenderedComponents(
+  functionLike: ts.FunctionLikeDeclaration,
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): RenderedComponentReference[] {
+  const references: RenderedComponentReference[] = [];
+  const body = functionLike.body;
+  if (!body) return references;
+
+  const readExpression = (expression: ts.Expression, kind: ComponentRenderKind): void => {
+    const current = unwrapParentheses(expression);
+    if (ts.isJsxElement(current)) {
+      addTag(current.openingElement.tagName, kind);
+      readJsxChildren(current.children, kind);
+      readJsxAttributes(current.openingElement.attributes, kind);
+      return;
+    }
+    if (ts.isJsxSelfClosingElement(current)) {
+      addTag(current.tagName, kind);
+      readJsxAttributes(current.attributes, kind);
+      return;
+    }
+    if (ts.isJsxFragment(current)) {
+      readJsxChildren(current.children, kind);
+      return;
+    }
+    if (ts.isConditionalExpression(current)) {
+      readExpression(current.whenTrue, "conditional");
+      readExpression(current.whenFalse, "conditional");
+      return;
+    }
+    if (ts.isBinaryExpression(current) && isConditionalOperator(current.operatorToken.kind)) {
+      readExpression(current.right, "conditional");
+      return;
+    }
+    if (ts.isArrayLiteralExpression(current)) {
+      for (const element of current.elements) {
+        if (ts.isExpression(element)) readExpression(element, kind);
+      }
+    }
+  };
+
+  const addTag = (tag: ts.JsxTagNameExpression, kind: ComponentRenderKind): void => {
+    const expression = tag.getText(sourceFile);
+    if (!/^[A-Z]/.test(expression)) return;
+    references.push({
+      expression,
+      localName: expression,
+      kind,
+      location: getLocation(tag, sourceFile, filePath),
+    });
+  };
+
+  const readJsxChildren = (children: ts.NodeArray<ts.JsxChild>, kind: ComponentRenderKind): void => {
+    for (const child of children) {
+      if (ts.isJsxElement(child) || ts.isJsxSelfClosingElement(child) || ts.isJsxFragment(child)) {
+        readExpression(child, kind);
+      } else if (ts.isJsxExpression(child) && child.expression && !ts.isFunctionLike(child.expression)) {
+        readExpression(child.expression, kind);
+      }
+    }
+  };
+
+  const readJsxAttributes = (attributes: ts.JsxAttributes, kind: ComponentRenderKind): void => {
+    for (const attribute of attributes.properties) {
+      if (!ts.isJsxAttribute(attribute) || !attribute.initializer ||
+        !ts.isJsxExpression(attribute.initializer) || !attribute.initializer.expression ||
+        ts.isFunctionLike(attribute.initializer.expression)) continue;
+      readExpression(attribute.initializer.expression, kind);
+    }
+  };
+
+  if (!ts.isBlock(body)) {
+    readExpression(body, "direct");
+    return references;
+  }
+  const visit = (node: ts.Node): void => {
+    if (node !== body && ts.isFunctionLike(node)) return;
+    if (ts.isReturnStatement(node) && node.expression) {
+      readExpression(node.expression, isConditionalReturn(node, body) ? "conditional" : "direct");
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return references.sort((left, right) =>
+    compareText(`${left.location.startLine}:${left.location.endLine}:${left.expression}:${left.kind}`,
+      `${right.location.startLine}:${right.location.endLine}:${right.expression}:${right.kind}`));
+}
+
+function isConditionalOperator(kind: ts.SyntaxKind): boolean {
+  return kind === ts.SyntaxKind.AmpersandAmpersandToken || kind === ts.SyntaxKind.BarBarToken ||
+    kind === ts.SyntaxKind.QuestionQuestionToken;
+}
+
+function isConditionalReturn(node: ts.ReturnStatement, body: ts.Block): boolean {
+  let current: ts.Node | undefined = node.parent;
+  while (current && current !== body) {
+    if (ts.isIfStatement(current) || ts.isSwitchStatement(current) || ts.isCaseClause(current) ||
+      ts.isDefaultClause(current) || ts.isConditionalExpression(current)) return true;
+    current = current.parent;
+  }
+  return false;
 }
 
 function collectComponentCandidates(

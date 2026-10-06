@@ -117,6 +117,14 @@ export interface RuntimeInteractionCandidate {
     resolvedHref: string;
   } | null;
   provenance: RuntimeCandidateSignalProvenance[];
+  navigation?: RuntimeCandidateNavigationEvidence;
+}
+
+export interface RuntimeCandidateNavigationEvidence {
+  classification: "explicit-destination" | "custom-navigation" | "none";
+  evidence: Array<"explicit-destination" | "navigation-context" | "menu-context" |
+    "repeated-clickable-sibling-group" | "strong-click-evidence">;
+  provenance: "dom-structure";
 }
 
 export interface RuntimeSemanticEvidence {
@@ -516,6 +524,7 @@ interface BrowserCandidateRecord {
   signals: RuntimeCandidateSignal[];
   declaredHref: string | null;
   resolvedHref: string | null;
+  navigationContext: Array<"navigation-context" | "menu-context" | "repeated-clickable-sibling-group">;
 }
 
 export async function captureInteractionCandidates(
@@ -555,6 +564,7 @@ export async function captureInteractionCandidates(
             }
           : null,
         provenance,
+        navigation: candidateNavigationEvidence(record, strength),
       };
     });
   } finally {
@@ -663,6 +673,7 @@ function collectBrowserCandidates(
       signals,
       declaredHref,
       resolvedHref,
+      navigationContext: navigationContext(element),
     });
   }
   return records;
@@ -671,6 +682,38 @@ function collectBrowserCandidates(
     if (element === document.body || element === document.documentElement) return true;
     const viewportArea = Math.max(1, innerWidth * innerHeight);
     return box.width * box.height / viewportArea > 0.8;
+  }
+
+  function navigationContext(element: HTMLElement): BrowserCandidateRecord["navigationContext"] {
+    const evidence: BrowserCandidateRecord["navigationContext"] = [];
+    const ancestors = [element, ...ancestorElements(element)];
+    if (ancestors.some((item) => item.tagName.toLowerCase() === "nav" ||
+      item.getAttribute("role")?.toLowerCase() === "navigation")) {
+      evidence.push("navigation-context");
+    }
+    if (ancestors.some((item) => ["menu", "menubar", "tablist"].includes(
+      item.getAttribute("role")?.toLowerCase() ?? ""))) {
+      evidence.push("menu-context");
+    }
+    const parent = element.parentElement;
+    if (parent) {
+      const siblings = [...parent.children].filter((item): item is HTMLElement => item instanceof HTMLElement);
+      const repeated = siblings.filter((item) => {
+        const box = item.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 && getComputedStyle(item).cursor === "pointer";
+      });
+      if (siblings.length >= 3 && repeated.length / siblings.length >= 0.75) {
+        evidence.push("repeated-clickable-sibling-group");
+      }
+    }
+    return evidence;
+  }
+
+  function ancestorElements(element: HTMLElement): HTMLElement[] {
+    const result: HTMLElement[] = [];
+    let current = element.parentElement;
+    while (current && current !== document.body) { result.push(current); current = current.parentElement; }
+    return result;
   }
 
   function boundedText(value: string): string {
@@ -694,6 +737,22 @@ function collectBrowserCandidates(
     }
     return `html>${parts.reverse().join(">")}`;
   }
+}
+
+function candidateNavigationEvidence(
+  record: BrowserCandidateRecord,
+  strength: RuntimeInteractionCandidate["strength"],
+): RuntimeCandidateNavigationEvidence {
+  if (record.declaredHref && record.resolvedHref) {
+    return { classification: "explicit-destination", evidence: ["explicit-destination"], provenance: "dom-structure" };
+  }
+  const structural = record.navigationContext;
+  if (strength === "strong" && structural.length > 0) {
+    return { classification: "custom-navigation", evidence: [...structural, "strong-click-evidence"],
+      provenance: "dom-structure" };
+  }
+  return { classification: "none", evidence: strength === "strong" ? ["strong-click-evidence"] : [],
+    provenance: "dom-structure" };
 }
 
 function candidateStrength(

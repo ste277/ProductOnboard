@@ -76,6 +76,7 @@ export interface RuntimeTransitionEdge {
   from: string;
   to: string | null;
   target: RuntimeProbeTarget | null;
+  targetMetadata?: RuntimeDiscoveryTargetMetadata;
   safety: RuntimeProbeSafety;
   interactionPerformed: boolean;
   transition: RuntimeProbeTransition | null;
@@ -97,6 +98,18 @@ export interface RuntimeSkippedTarget {
   text: string;
   decision: "blocked" | "unknown" | "not-eligible";
   reasons: string[];
+  targetMetadata?: RuntimeDiscoveryTargetMetadata;
+}
+
+export type RuntimeNavigationClassification = "explicit-application-navigation" | "custom-navigation" |
+  "utility-navigation" | "non-navigation" | "unknown";
+export type RuntimeNavigationPriority = "explicit-navigation" | "strong-custom-navigation" |
+  "supporting-navigation" | "safe-control" | "utility-navigation" | "unknown" |
+  "semantic-image" | "form-control";
+export interface RuntimeDiscoveryTargetMetadata {
+  classification: RuntimeNavigationClassification;
+  priority: RuntimeNavigationPriority;
+  evidence: string[];
 }
 
 export interface RuntimeDiscoverySummary {
@@ -137,8 +150,8 @@ interface FrontierEntry {
 }
 
 type DiscoveryTarget =
-  | ({ source: "semantic-element" } & RuntimeInteractiveElement)
-  | ({ source: "interaction-candidate" } & RuntimeInteractionCandidate);
+  | ({ source: "semantic-element"; discovery: RuntimeDiscoveryTargetMetadata } & RuntimeInteractiveElement)
+  | ({ source: "interaction-candidate"; discovery: RuntimeDiscoveryTargetMetadata } & RuntimeInteractionCandidate);
 
 export async function discoverRuntimeNavigation(
   options: RuntimeNavigationDiscoveryOptions,
@@ -213,13 +226,14 @@ export async function discoverRuntimeNavigation(
         continue;
       }
       if (!probe.interaction.performed || !probe.after || !probe.transition) {
-        graph.transitions.push(edgeFromProbe(node.id, null, probe, ["probe-failed"]));
+        graph.transitions.push(edgeFromProbe(node.id, null, probe, ["probe-failed"], target.discovery));
         continue;
       }
 
       const fingerprint = fingerprintRuntimeState(probe.after);
       const existingId = visited.get(fingerprint);
-      const mutationStop = probe.transition.mutationMethods.length > 0;
+      const baselineMethods = new Set(mutationMethods(probe.before.network));
+      const mutationStop = probe.transition.mutationMethods.some((method) => !baselineMethods.has(method));
       const boundary = !allowedOrigins.includes(new URL(probe.after.finalUrl).origin);
       const stopReasons: RuntimeDiscoveryBranchStopReason[] = [];
       if (existingId) addStop(stopReasons, "visited");
@@ -234,7 +248,7 @@ export async function discoverRuntimeNavigation(
       if (!existingId) {
         if (graph.nodes.length >= limits.maxStates) {
           stateLimited = true;
-          graph.transitions.push(edgeFromProbe(node.id, null, probe, stopReasons, "max-states"));
+          graph.transitions.push(edgeFromProbe(node.id, null, probe, stopReasons, target.discovery, "max-states"));
           continue;
         }
         const child = makeNode(probe.after, node.depth + 1, startOrigin, allowedOrigins,
@@ -244,7 +258,7 @@ export async function discoverRuntimeNavigation(
         visited.set(fingerprint, child.id);
         if (child.expandable) frontier.push({ nodeId: child.id, manifest: probe.after });
       }
-      graph.transitions.push(edgeFromProbe(node.id, destinationId, probe, stopReasons));
+      graph.transitions.push(edgeFromProbe(node.id, destinationId, probe, stopReasons, target.discovery));
     }
     if (transitionLimited || stateLimited) break;
   }
@@ -276,20 +290,59 @@ export function fingerprintRuntimeState(manifest: RuntimeCaptureManifest): strin
 
 function orderedTargets(manifest: RuntimeCaptureManifest): DiscoveryTarget[] {
   const semantic = manifest.elements
-    .map((item) => ({ ...item, source: "semantic-element" as const }))
+    .map((item) => ({ ...item, source: "semantic-element" as const,
+      discovery: classifyRuntimeDiscoveryTarget({ ...item, source: "semantic-element" }, manifest.finalUrl) }))
     .sort((left, right) => targetRank(left) - targetRank(right) || left.domPath.localeCompare(right.domPath) || left.id.localeCompare(right.id));
   const candidates = manifest.interactionCandidates
-    .map((item) => ({ ...item, source: "interaction-candidate" as const }))
+    .map((item) => ({ ...item, source: "interaction-candidate" as const,
+      discovery: classifyRuntimeDiscoveryTarget({ ...item, source: "interaction-candidate" }, manifest.finalUrl) }))
     .sort((left, right) => targetRank(left) - targetRank(right) || left.domPath.localeCompare(right.domPath) || left.id.localeCompare(right.id));
   return [...semantic, ...candidates].sort((left, right) =>
     targetRank(left) - targetRank(right) || left.domPath.localeCompare(right.domPath) || left.id.localeCompare(right.id));
 }
 
 function targetRank(target: DiscoveryTarget): number {
-  if (target.source === "semantic-element" && target.role === "link" && target.resolvedHref) return 0;
-  if (target.source === "semantic-element") return 1;
-  if (target.strength === "strong") return 2;
-  return 3;
+  return ["explicit-navigation", "strong-custom-navigation", "supporting-navigation", "safe-control",
+    "utility-navigation", "unknown", "semantic-image", "form-control"].indexOf(target.discovery.priority);
+}
+
+export function classifyRuntimeDiscoveryTarget(
+  target: RuntimeProbeTarget,
+  currentUrl: string,
+): RuntimeDiscoveryTargetMetadata {
+  if (isProbeFormControl(target)) {
+    return { classification: "non-navigation", priority: "form-control", evidence: ["form-control"] };
+  }
+  if (target.source === "semantic-element" && target.role === "img") {
+    return { classification: "non-navigation", priority: "semantic-image", evidence: ["semantic-image"] };
+  }
+  const declaredHref = target.source === "semantic-element" ? target.declaredHref : target.destination?.declaredHref;
+  const resolvedHref = target.source === "semantic-element" ? target.resolvedHref : target.destination?.resolvedHref;
+  if (declaredHref && resolvedHref) {
+    const destination = new URL(resolvedHref, currentUrl);
+    const fragment = declaredHref.startsWith("#") && !declaredHref.startsWith("#/") &&
+      destination.pathname === new URL(currentUrl).pathname;
+    return fragment
+      ? { classification: "utility-navigation", priority: "utility-navigation",
+          evidence: ["explicit-destination", "utility-fragment"] }
+      : { classification: "explicit-application-navigation", priority: "explicit-navigation",
+          evidence: ["explicit-destination", declaredHref.startsWith("#/") ? "application-hash" : "application-link"] };
+  }
+  if (target.source === "interaction-candidate" && target.navigation?.classification === "custom-navigation") {
+    return { classification: "custom-navigation", priority: target.strength === "strong"
+      ? "strong-custom-navigation" : "supporting-navigation", evidence: [...target.navigation.evidence] };
+  }
+  if (target.source === "semantic-element" && ["button", "menuitem", "tab"].includes(target.role)) {
+    return { classification: "unknown", priority: "safe-control", evidence: ["semantic-control"] };
+  }
+  return { classification: "unknown", priority: "unknown", evidence: target.source === "interaction-candidate"
+    ? target.signals.map((item) => item.type) : ["no-navigation-evidence"] };
+}
+
+function isProbeFormControl(target: RuntimeProbeTarget): boolean {
+  return target.source === "semantic-element" &&
+    (["textbox", "searchbox", "combobox", "checkbox", "radio", "switch", "option"].includes(target.role) ||
+      ["input", "textarea", "select"].includes(target.type));
 }
 
 function isFormControl(target: DiscoveryTarget): boolean {
@@ -350,13 +403,14 @@ function edgeFromProbe(
   to: string | null,
   probe: RuntimeNavigationProbeResult,
   stopReasons: RuntimeDiscoveryBranchStopReason[],
+  targetMetadata: RuntimeDiscoveryTargetMetadata,
   failure?: string,
 ): RuntimeTransitionEdge {
   const baselineMutationMethods = mutationMethods(probe.before.network);
   const observedMutationMethods = probe.transition?.mutationMethods ?? [];
   return {
     id: `runtime-transition:${stableHash(`${from}|${to ?? "none"}|${probe.targetId}`)}`,
-    from, to, target: probe.target, safety: probe.safety,
+    from, to, target: probe.target, targetMetadata, safety: probe.safety,
     interactionPerformed: probe.interaction.performed,
     transition: probe.transition,
     status: failure || !probe.interaction.performed ? "failed" : "observed",
@@ -374,7 +428,7 @@ function failedEdge(from: string, target: DiscoveryTarget, error: unknown): Runt
   const safety: RuntimeProbeSafety = { decision: "unknown", reasons: ["probe-failed"], provenance: "safety-rule" };
   return {
     id: `runtime-transition:${stableHash(`${from}|${target.id}|failed`)}`,
-    from, to: null, target, safety, interactionPerformed: false, transition: null,
+    from, to: null, target, targetMetadata: target.discovery, safety, interactionPerformed: false, transition: null,
     status: "failed", stopReasons: ["probe-failed"], baselineMutationMethods: [], mutationMethods: [],
     runtimeProbeId: `runtime-probe-failed:${stableHash(`${from}|${target.id}`)}`,
     network: [],
@@ -402,7 +456,8 @@ function skipped(
     ? target.accessibleName || target.visibleText || ""
     : target.accessibleName || target.text;
   return { id: `runtime-skipped:${stableHash(`${stateId}|${target.id}|${decision}`)}`,
-    stateId, targetId: target.id, targetType: target.source, text, decision, reasons };
+    stateId, targetId: target.id, targetType: target.source, text, decision, reasons,
+    targetMetadata: target.discovery };
 }
 
 function captureOptions(options: RuntimeNavigationDiscoveryOptions, url: string, outputDirectory: string) {

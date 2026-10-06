@@ -21,12 +21,34 @@ export type FeatureNameSourceType =
   | "static-heading"
   | "runtime-heading"
   | "component"
+  | "route-literal"
+  | "route-bound-value"
+  | "runtime-route-structure"
+  | "route-pattern"
   | "route-segment"
   | "runtime-name";
 
 export interface FeatureNameSource {
   type: FeatureNameSourceType;
   evidenceId: string;
+}
+
+export type FeatureRouteBindingClassification = "stable-slug" | "opaque-identifier" | "redacted";
+
+export interface FeatureRouteBinding {
+  runtimeStateId: string;
+  parameter: string;
+  position: number;
+  classification: FeatureRouteBindingClassification;
+  value?: string;
+}
+
+export interface FeatureRouteIdentity {
+  selectedReconciliationIds: string[];
+  staticRoutePattern: string;
+  runtimePaths: string[];
+  bindings: FeatureRouteBinding[];
+  identityKey: string;
 }
 
 export interface FeatureStaticReference {
@@ -89,6 +111,7 @@ export interface FeatureCandidate {
   id: string;
   name: string;
   nameSource: FeatureNameSource;
+  routeIdentity?: FeatureRouteIdentity;
   root: { type: "static-route" | "static-navigation" | "runtime-state"; evidenceId: string };
   entryPoints: FeatureEntryPoint[];
   routes: FeatureEvidenceItem[];
@@ -152,6 +175,7 @@ interface FeatureSeed {
   route?: ProductEvidenceNode;
   navigation?: ProductEvidenceNode;
   states: RuntimeStateNode[];
+  identityKey?: string;
 }
 
 const USER_FACING_NODE_TYPES = new Set(["route", "navigation", "component", "ui-element", "ui-event"]);
@@ -203,7 +227,16 @@ function featureSeeds(graph: ProductEvidenceGraph, runtime: RuntimeNavigationDis
     const uniqueStates = uniqueBy(states, (state) => state.id);
     uniqueStates.forEach((state) => assignedStates.add(state.id));
     if (uniqueStates.length <= 1) seeds.push({ rootType: "static-route", rootId: route.id, route, states: uniqueStates });
-    else for (const state of uniqueStates) seeds.push({ rootType: "static-route", rootId: `${route.id}|${state.id}`, route, states: [state] });
+    else if (routeKey.includes(":")) {
+      const groups = new Map<string, RuntimeStateNode[]>();
+      for (const state of uniqueStates) {
+        const selected = selectedRouteResult(route.id, state.id, reconciliation);
+        const key = selected ? routeStructureKey(routeKey, selected.route?.normalizedApplicationPath ?? runtimeRoute(state.url)) : state.id;
+        groups.set(key, [...(groups.get(key) ?? []), state]);
+      }
+      for (const [identityKey, states] of groups) seeds.push({ rootType: "static-route",
+        rootId: `${route.id}|${identityKey}`, route, states, identityKey });
+    } else for (const state of uniqueStates) seeds.push({ rootType: "static-route", rootId: `${route.id}|${state.id}`, route, states: [state] });
   }
   for (const navigation of graph.nodes.filter((item) => item.type === "navigation" && staticValue(item.data.label))) {
     if (outgoing(graph, navigation.id, "NAVIGATES_TO").length > 0) continue;
@@ -240,10 +273,11 @@ function buildFeature(seed: FeatureSeed, input: BuildFeatureModelInput,
     (result.static.some((ref) => relevantNodeIds.includes(ref.nodeId)) ||
     result.runtime.some((ref) => seed.states.some((state) => ref.stateId === state.id) ||
       Boolean(ref.transitionId && transitionIds.includes(ref.transitionId)))));
-  const name = chooseName(seed, navigationNodes, input.staticGraph, uiIds, eventIds);
+  const routeIdentity = buildRouteIdentity(seed, reconciliation);
+  const name = chooseName(seed, navigationNodes, input.staticGraph, uiIds, eventIds, routeIdentity);
   const id = `feature:${stableHash(JSON.stringify({ root: seed.rootType,
     route: seed.route ? normalizedRoute(seed.route) : staticValue(seed.navigation?.data.destination) ?? "",
-    state: seed.rootType === "runtime-state" || seed.rootId !== seed.route?.id
+    state: seed.identityKey ? seed.identityKey : seed.rootType === "runtime-state" || seed.rootId !== seed.route?.id
       ? seed.states.map((item) => item.fingerprint).sort() : [] }))}`;
   const routes = seed.route ? [evidenceItem(seed.route, "route", relevantResults)] : [];
   const ui = uiIds.map((nodeId) => evidenceItem(node(input.staticGraph, nodeId), "ui", relevantResults));
@@ -269,7 +303,8 @@ function buildFeature(seed: FeatureSeed, input: BuildFeatureModelInput,
   const screenshots = seed.states.filter((state) => state.screenshot.captured).map((state) => ({ runtimeStateId: state.id,
     path: state.screenshot.path, width: state.screenshot.width, height: state.screenshot.height, captured: true }));
   return {
-    id, name: name.name, nameSource: name.source, root: { type: seed.rootType, evidenceId: seed.rootId },
+    id, name: name.name, nameSource: name.source, ...(routeIdentity ? { routeIdentity } : {}),
+    root: { type: seed.rootType, evidenceId: seed.rootId },
     entryPoints: entryPoints(navigationNodes, seed.states, input.runtimeDiscovery), routes,
     runtimeStates: seed.states.map((state) => state.id).sort(), ui: ui.sort(compareItem), actions: actions.sort(compareItem),
     api: api.sort(compareItem), graphql: graphql.sort(compareItem), screenshots,
@@ -282,7 +317,7 @@ function buildFeature(seed: FeatureSeed, input: BuildFeatureModelInput,
 }
 
 function chooseName(seed: FeatureSeed, navigation: ProductEvidenceNode[], graph: ProductEvidenceGraph,
-  uiIds: string[], eventIds: string[]): { name: string; source: FeatureNameSource } {
+  uiIds: string[], eventIds: string[], routeIdentity?: FeatureRouteIdentity): { name: string; source: FeatureNameSource } {
   const nav = navigation.find((item) => staticValue(item.data.label));
   if (nav) return named(staticValue(nav.data.label)!, "navigation-label", nav.id);
   const actionUi = uiIds.map((id) => node(graph, id)).find((item) =>
@@ -296,6 +331,7 @@ function chooseName(seed: FeatureSeed, navigation: ProductEvidenceNode[], graph:
   }
   const componentId = seed.route && outgoing(graph, seed.route.id, "ROUTE_RENDERS_COMPONENT")[0]?.to;
   if (componentId) return named(node(graph, componentId).label, "component", componentId);
+  if (routeIdentity) return routeIdentityName(routeIdentity);
   if (seed.route) return named(routeName(normalizedRoute(seed.route)), "route-segment", seed.route.id);
   const state = seed.states[0]!;
   const runtimeName = state.semanticElements.find((item) => item.accessibleName || item.visibleText) ?? state.interactionCandidates[0];
@@ -379,6 +415,20 @@ export function validateFeatureModel(model: FeatureModel, graph: ProductEvidence
   for (const feature of model.features) {
     if (!feature.name.trim()) throw new Error(`Invalid feature name for ${feature.id}`);
     if (!validNameSource(feature, nodeIds, stateIds, runtime)) throw new Error(`Invalid name source for ${feature.id}`);
+    if (feature.routeIdentity) {
+      if (!feature.routes.some((item) => item.label === feature.routeIdentity!.staticRoutePattern)) {
+        throw new Error(`Invalid route identity pattern for ${feature.id}`);
+      }
+      for (const id of feature.routeIdentity.selectedReconciliationIds) if (!reconciliationIds.has(id)) {
+        throw new Error(`Invalid route identity reconciliation ${id}`);
+      }
+      for (const binding of feature.routeIdentity.bindings) {
+        if (!feature.runtimeStates.includes(binding.runtimeStateId)) throw new Error(`Invalid route binding state ${binding.runtimeStateId}`);
+        if (binding.classification !== "stable-slug" && binding.value !== undefined) {
+          throw new Error(`Sensitive route binding value retained for ${feature.id}`);
+        }
+      }
+    }
     for (const id of feature.provenance.staticNodeIds) if (!nodeIds.has(id)) throw new Error(`Invalid static reference ${id}`);
     for (const id of feature.provenance.staticEdgeIds) if (!edgeIds.has(id)) throw new Error(`Invalid static edge reference ${id}`);
     for (const id of feature.runtimeStates) if (!stateIds.has(id)) throw new Error(`Invalid runtime reference ${id}`);
@@ -486,6 +536,99 @@ function meaningfulRuntimeState(state: RuntimeStateNode): boolean {
   return state.semanticElements.some((item) => Boolean(item.accessibleName || item.visibleText)) ||
     state.interactionCandidates.some((item) => Boolean(item.accessibleName || item.text));
 }
+
+function buildRouteIdentity(seed: FeatureSeed, reconciliation: ReconciledEvidenceResult[]): FeatureRouteIdentity | undefined {
+  if (!seed.route || seed.states.length === 0) return undefined;
+  const pattern = normalizedRoute(seed.route);
+  const selected = seed.states.map((state) => ({ state, result: selectedRouteResult(seed.route!.id, state.id, reconciliation) }))
+    .filter((item): item is { state: RuntimeStateNode; result: ReconciledEvidenceResult } => Boolean(item.result?.route));
+  if (selected.length !== seed.states.length) return undefined;
+  const bindings = selected.flatMap(({ state, result }) => routeBindings(pattern,
+    result.route!.normalizedApplicationPath, state.id));
+  const paths = selected.map(({ result }) => sanitizedRuntimePath(pattern, result.route!.normalizedApplicationPath));
+  return { selectedReconciliationIds: selected.map(({ result }) => result.id).sort(), staticRoutePattern: pattern,
+    runtimePaths: unique(paths).sort(), bindings, identityKey: seed.identityKey ?? routeStructureKey(pattern,
+      selected[0]!.result.route!.normalizedApplicationPath) };
+}
+
+function selectedRouteResult(routeId: string, stateId: string,
+  reconciliation: ReconciledEvidenceResult[]): ReconciledEvidenceResult | undefined {
+  return reconciliation.find((item) => item.domain === "route" && item.status === "corroborated" &&
+    item.static.length === 1 && item.static[0]?.nodeId === routeId &&
+    item.runtime.some((ref) => ref.stateId === stateId) &&
+    item.route?.candidates.some((candidate) => candidate.staticRouteId === routeId && candidate.selection === "selected"));
+}
+
+function routeBindings(pattern: string, runtimePath: string, stateId: string): FeatureRouteBinding[] {
+  const patternSegments = pathSegments(pattern);
+  const runtimeSegments = pathSegments(runtimePath);
+  return patternSegments.flatMap((segment, position) => {
+    if (!segment.startsWith(":")) return [];
+    const raw = runtimeSegments[position];
+    if (!raw) return [];
+    const classification = classifyRouteValue(raw);
+    return [{ runtimeStateId: stateId, parameter: segment.replace(/^:/, "").replace(/[?*+]$/, ""), position,
+      classification, ...(classification === "stable-slug" ? { value: raw } : {}) }];
+  });
+}
+
+function routeIdentityName(identity: FeatureRouteIdentity): { name: string; source: FeatureNameSource } {
+  if (identity.staticRoutePattern === "/") {
+    return named("Root", "route-literal", identity.selectedReconciliationIds[0]!);
+  }
+  const literals = pathSegments(identity.staticRoutePattern).filter((segment) => !segment.startsWith(":") && segment !== "*");
+  const values = unique(identity.bindings.filter((binding) => binding.classification === "stable-slug" && binding.value)
+    .map((binding) => binding.value!));
+  const evidenceId = identity.selectedReconciliationIds[0]!;
+  if (literals.length > 0) {
+    const parts = compactIdentityParts([...literals, ...values]);
+    return named(parts.map(humanizeRouteSegment).join(" / "), values.length ? "route-bound-value" : "route-literal", evidenceId);
+  }
+  if (values.length > 0) {
+    const parts = compactIdentityParts(values);
+    return named(parts.map(humanizeRouteSegment).join(" / "), parts.length > 1 ? "runtime-route-structure" : "route-bound-value", evidenceId);
+  }
+  return named(identity.staticRoutePattern, "route-pattern", evidenceId);
+}
+
+function compactIdentityParts(parts: string[]): string[] {
+  const distinct = unique(parts);
+  return distinct.length <= 2 ? distinct : [distinct[0]!, distinct.at(-1)!];
+}
+
+function routeStructureKey(pattern: string, runtimePath: string): string {
+  const patternSegments = pathSegments(pattern);
+  const runtimeSegments = pathSegments(runtimePath);
+  const segments = runtimeSegments.map((segment, index) => {
+    const patternSegment = patternSegments[index];
+    if (!patternSegment?.startsWith(":")) return segment;
+    return classifyRouteValue(segment) === "stable-slug" ? segment.toLowerCase() : ":opaque";
+  });
+  return `${pattern}|/${segments.join("/")}`;
+}
+
+function sanitizedRuntimePath(pattern: string, runtimePath: string): string {
+  const patternSegments = pathSegments(pattern);
+  return `/${pathSegments(runtimePath).map((segment, index) => patternSegments[index]?.startsWith(":") &&
+    classifyRouteValue(segment) !== "stable-slug" ? "[opaque]" : segment).join("/")}`;
+}
+
+function classifyRouteValue(value: string): FeatureRouteBindingClassification {
+  const decoded = decodeURIComponentSafe(value);
+  if (/redact|masked|hidden|^\*+$/i.test(decoded) || /^\[[^\]]+\]$/.test(decoded)) return "redacted";
+  if (/^\d+$/.test(decoded) || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(decoded) ||
+    /^[0-9a-f]{16,}$/i.test(decoded) || (decoded.length >= 20 && /[a-z]/i.test(decoded) && /\d/.test(decoded) && /^[a-z0-9_-]+$/i.test(decoded))) {
+    return "opaque-identifier";
+  }
+  return /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/i.test(decoded) && decoded.length <= 64
+    ? "stable-slug" : "opaque-identifier";
+}
+
+function decodeURIComponentSafe(value: string): string { try { return decodeURIComponent(value); } catch { return value; } }
+function pathSegments(value: string): string[] { return normalizeRoute(value).split("/").filter(Boolean); }
+function humanizeRouteSegment(value: string): string {
+  return value.replace(/[-_]+/g, " ").replace(/\b\w/g, (character) => character.toUpperCase());
+}
 function named(name: string, type: FeatureNameSourceType, evidenceId: string) {
   return { name: name.trim(), source: { type, evidenceId } };
 }
@@ -547,6 +690,9 @@ function summarize(features: FeatureCandidate[], relationships: FeatureRelations
 function validNameSource(feature: FeatureCandidate, nodes: Set<string>, states: Set<string>, runtime: RuntimeNavigationDiscoveryGraph): boolean {
   if (["navigation-label", "primary-action", "static-heading", "component", "route-segment"].includes(feature.nameSource.type)) {
     return nodes.has(feature.nameSource.evidenceId);
+  }
+  if (["route-literal", "route-bound-value", "runtime-route-structure", "route-pattern"].includes(feature.nameSource.type)) {
+    return feature.routeIdentity?.selectedReconciliationIds.includes(feature.nameSource.evidenceId) ?? false;
   }
   if (states.has(feature.nameSource.evidenceId)) return true;
   return runtime.nodes.some((state) => state.semanticElements.some((item) => item.id === feature.nameSource.evidenceId) ||

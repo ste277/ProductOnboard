@@ -64,6 +64,7 @@ export interface ProductEvidenceNode {
 
 export type ProductEvidenceEdgeType =
   | "ROUTE_RENDERS_COMPONENT"
+  | "COMPONENT_RENDERS_COMPONENT"
   | "NAVIGATES_TO"
   | "CONTAINS_ELEMENT"
   | "HAS_EVENT"
@@ -122,6 +123,7 @@ const EDGE_ENDPOINTS: Record<
   readonly [ProductEvidenceNodeType, ProductEvidenceNodeType]
 > = {
   ROUTE_RENDERS_COMPONENT: ["route", "component"],
+  COMPONENT_RENDERS_COMPONENT: ["component", "component"],
   NAVIGATES_TO: ["navigation", "route"],
   CONTAINS_ELEMENT: ["component", "ui-element"],
   HAS_EVENT: ["ui-element", "ui-event"],
@@ -160,6 +162,45 @@ export function buildProductEvidenceGraph(
     });
     componentIds.set(componentKey(component.name, component.location), id);
     addUiTree(graph, ids, component.name, component.root, id, elementIds);
+  }
+
+  for (const component of input.ui.components) {
+    const parentId = componentIds.get(componentKey(component.name, component.location))!;
+    const resolved = new Map<string, GraphEvidence[]>();
+    for (const reference of component.renderedComponents ?? []) {
+      let childId = reference.expression.includes(".")
+        ? undefined
+        : resolveComponent(input.ui, componentIds, reference.localName, reference.location);
+      const symbol = !childId && input.resolution && !reference.expression.includes(".")
+        ? findImportResolution(input.resolution, component.location.path, reference.localName)
+        : undefined;
+      if (!childId && symbol) childId = resolveComponentTarget(input.ui, componentIds, symbol);
+      const renderEvidence: GraphEvidence = {
+        source: "ui-structure",
+        strength: childId ? "resolved" : "unresolved",
+        location: reference.location,
+        details: { expression: reference.expression, renderKind: reference.kind },
+      };
+      if (childId) {
+        const evidence = resolved.get(childId) ?? [];
+        evidence.push(renderEvidence, ...(symbol ? resolutionEvidence(symbol) : []));
+        resolved.set(childId, evidence);
+      } else {
+        const failure = input.resolution && !reference.expression.includes(".")
+          ? findUnresolvedImport(input.resolution, component.location.path, reference.localName)
+          : undefined;
+        addUnresolved(graph, ids, "COMPONENT_RENDERS_COMPONENT", parentId, reference.expression,
+          reference.expression.includes(".")
+            ? "JSX member component could not be uniquely resolved"
+            : failure ? `Module resolution failed: ${failure.reason}` : symbol
+              ? "Resolved render symbol has no matching UI component"
+              : "Rendered component reference could not be resolved",
+          symbol || failure ? "module-resolution" : "ui-structure", reference.location);
+      }
+    }
+    for (const [childId, evidence] of [...resolved].sort(([left], [right]) => compareText(left, right))) {
+      addEdge(graph, ids, "COMPONENT_RENDERS_COMPONENT", parentId, childId, evidence);
+    }
   }
 
   for (const callable of input.calls.callers) {

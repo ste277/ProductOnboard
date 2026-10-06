@@ -284,6 +284,217 @@ test("resolves imported route components and cross-file callable cycles determin
   );
 });
 
+test("resolves configured path aliases across exports, routes, calls, and product evidence", async () => {
+  const { resolution, graph } = await analyzeFiles({
+    "tsconfig.json": JSON.stringify({
+      compilerOptions: {
+        baseUrl: ".",
+        paths: {
+          "@exact": ["src/exact"],
+          "@app/*": ["src/*"],
+          "@fallback/*": ["missing/*", "legacy/*"],
+          "@nile/*": ["packages/*/src"],
+        },
+      },
+    }),
+    "src/exact.ts": "export default function exact() {}\n",
+    "src/view.tsx": "export function View() { return <div>View</div>; }\n",
+    "src/script.js": "export function fromJs() {}\n",
+    "src/widget.jsx": "export function Widget() { return <div>Widget</div>; }\n",
+    "src/pages/index.tsx": "export default function TicketPage() { return <div>Tickets</div>; }\n",
+    "legacy/old.ts": "export function oldApi() {}\n",
+    "src/js-origin.js": 'import { fromJs } from "@app/script";\nexport function useJs() { fromJs(); }\n',
+    "src/jsx-origin.jsx": 'import { Widget } from "@app/widget";\nexport function UseJsx() { return <Widget />; }\n',
+    "packages/tickets/src/service.ts": [
+      'import { ApolloClient, gql } from "@apollo/client";',
+      "const client = new ApolloClient({});",
+      "const SAVE = gql`mutation SaveTicket { saveTicket }`;",
+      "export async function saveTicket() {",
+      '  await fetch("/api/tickets", { method: "POST" });',
+      "  return client.mutate({ mutation: SAVE });",
+      "}",
+      "",
+    ].join("\n"),
+    "packages/tickets/src/index.ts": 'export { saveTicket as persistTicket } from "./service";\n',
+    "src/App.tsx": [
+      'import exact from "@exact";',
+      'import { View as AliasedView } from "@app/view";',
+      'import { fromJs } from "@app/script";',
+      'import { Widget } from "@app/widget";',
+      'import TicketPage from "@app/pages";',
+      'import { oldApi } from "@fallback/old";',
+      'import { persistTicket } from "@nile/tickets";',
+      "export function App() {",
+      "  exact(); fromJs(); oldApi(); persistTicket();",
+      '  return <><Route path="/tickets" element={<TicketPage />} /><AliasedView /><Widget /></>;',
+      "}",
+      "",
+    ].join("\n"),
+  });
+
+  const configured = resolution.resolutions.filter((item) => item.configuredModule?.kind === "path-alias");
+  assert.equal(configured.length, 9);
+  assert.ok(configured.every((item) => item.evidence.some((evidence) => evidence.kind === "configuration")));
+  assert.equal(
+    configured.find((item) => item.localName === "oldApi")?.configuredModule?.expandedTarget,
+    "legacy/old",
+  );
+  assert.equal(
+    configured.find((item) => item.localName === "persistTicket")?.strength,
+    "re-exported",
+  );
+  assert.ok(graph.edges.some((edge) => edge.type === "ROUTE_RENDERS_COMPONENT"));
+  assert.ok(graph.edges.some((edge) => edge.type === "CALLS"));
+  assert.ok(graph.edges.some((edge) => edge.type === "PERFORMS_HTTP_REQUEST"));
+  assert.ok(graph.edges.some((edge) => edge.type === "PERFORMS_GRAPHQL_EXECUTION"));
+});
+
+test("supports baseUrl and inherited path mappings without broad alias fallbacks", async () => {
+  const { resolution } = await analyzeFiles({
+    "tsconfig.json": JSON.stringify({
+      compilerOptions: { baseUrl: ".", paths: { "@shared/*": ["shared/*"] } },
+    }),
+    "src/tsconfig.json": JSON.stringify({ extends: "../tsconfig.json" }),
+    "shared/api.ts": "export function sharedApi() {}\n",
+    "packages/api/index.ts": "export default function accidentalMatch() {}\n",
+    "src/local.ts": "export function localApi() {}\n",
+    "src/use.ts": [
+      'import { sharedApi } from "@shared/api";',
+      'import { localApi } from "src/local";',
+      'import { unknown } from "@unknown/api";',
+      'import partial from "@sharedly/api";',
+      'import vendor from "vendor";',
+      "export function use() { sharedApi(); localApi(); unknown(); partial(); vendor(); }",
+      "",
+    ].join("\n"),
+  });
+
+  assert.equal(resolution.resolutions.find((item) => item.localName === "sharedApi")?.configuredModule?.configPath, "src/tsconfig.json");
+  assert.equal(resolution.resolutions.find((item) => item.localName === "localApi")?.configuredModule?.kind, "base-url");
+  assert.equal(resolution.unresolved.find((item) => item.localName === "unknown")?.reason, "external-module");
+  assert.equal(resolution.unresolved.find((item) => item.localName === "partial")?.reason, "external-module");
+  assert.equal(resolution.unresolved.find((item) => item.localName === "vendor")?.reason, "external-module");
+});
+
+test("resolves workspace package subpaths when a broader path alias target is absent", async () => {
+  const { resolution, graph } = await analyzeFiles({
+    "package.json": JSON.stringify({ private: true, workspaces: ["packages/*"] }),
+    "tsconfig.json": JSON.stringify({
+      compilerOptions: { baseUrl: ".", paths: { "@scope/*": ["packages/*/src"] } },
+    }),
+    "packages/shell/package.json": JSON.stringify({ name: "@scope/shell", private: true }),
+    "packages/shell/src/Pages/AppHomePage.tsx": [
+      "function AppHomePage() { return <main>Workspace home</main>; }",
+      "export default withRouter(withLDConsumer()(AppHomePage));",
+      "",
+    ].join("\n"),
+    "packages/home/src/App.tsx": [
+      'import AppHomePage from "@scope/shell/src/Pages/AppHomePage";',
+      'export function App() { return <Route path="/onboard/:pagename" component={AppHomePage} />; }',
+      "",
+    ].join("\n"),
+  });
+
+  const resolved = resolution.resolutions.find((item) => item.localName === "AppHomePage");
+  assert.equal(resolved?.resolvedModule, "packages/shell/src/Pages/AppHomePage.tsx");
+  assert.equal(resolved?.workspaceModule?.packageName, "@scope/shell");
+  assert.equal(resolved?.workspaceModule?.manifestPath, "packages/shell/package.json");
+  assert.equal(resolved?.target.name, "AppHomePage");
+  assert.equal(resolved?.configuredModule, undefined);
+  assert.ok(resolved?.evidence.some((item) => item.kind === "workspace-package"));
+  assert.ok(graph.edges.some((edge) => edge.type === "ROUTE_RENDERS_COMPONENT"));
+});
+
+test("does not unwrap unsupported component export calls", async () => {
+  const { resolution, graph } = await analyzeFiles({
+    "src/App.tsx": [
+      'import WrappedPage from "./WrappedPage";',
+      'export function App() { return <Route path="/wrapped" component={WrappedPage} />; }',
+      "",
+    ].join("\n"),
+    "src/WrappedPage.tsx": [
+      "function WrappedPage() { return <main>Wrapped</main>; }",
+      "export default connect({})(WrappedPage);",
+      "",
+    ].join("\n"),
+  });
+
+  assert.equal(
+    resolution.resolutions.find((item) => item.localName === "WrappedPage")?.target.name,
+    "<anonymous-default>",
+  );
+  assert.equal(graph.edges.some((edge) => edge.type === "ROUTE_RENDERS_COMPONENT"), false);
+  assert.ok(graph.unresolved.some((item) =>
+    item.relationship === "ROUTE_RENDERS_COMPONENT" &&
+    item.reason === "Associated route component is not a same-file UI component"));
+});
+
+test("keeps workspace package misses explicit and does not treat dependencies as workspaces", async () => {
+  const { resolution } = await analyzeFiles({
+    "package.json": JSON.stringify({ workspaces: { packages: ["packages/*"] } }),
+    "packages/ui/package.json": JSON.stringify({ name: "@scope/ui", main: "src/index" }),
+    "packages/ui/src/other.ts": "export function other() {}\n",
+    "src/use.ts": [
+      'import missing from "@scope/ui";',
+      'import vendor from "vendor/subpath";',
+      "export function use() { missing(); vendor(); }",
+      "",
+    ].join("\n"),
+  });
+
+  const missing = resolution.unresolved.find((item) => item.localName === "missing");
+  assert.equal(missing?.reason, "workspace-package-target-not-found");
+  assert.equal(missing?.workspaceModule?.manifestPath, "packages/ui/package.json");
+  assert.equal(resolution.unresolved.find((item) => item.localName === "vendor")?.reason, "external-module");
+});
+
+test("keeps duplicate workspace package names ambiguous", async () => {
+  const { resolution, graph } = await analyzeFiles({
+    "package.json": JSON.stringify({ workspaces: ["packages/*"] }),
+    "packages/one/package.json": JSON.stringify({ name: "@scope/shared" }),
+    "packages/one/Page.tsx": "export default function Page() { return <main>One</main>; }\n",
+    "packages/two/package.json": JSON.stringify({ name: "@scope/shared" }),
+    "packages/two/Page.tsx": "export default function Page() { return <main>Two</main>; }\n",
+    "src/App.tsx": [
+      'import Page from "@scope/shared/Page";',
+      'export function App() { return <Route path="/page" component={Page} />; }',
+      "",
+    ].join("\n"),
+  });
+
+  const unresolved = resolution.unresolved.find((item) => item.localName === "Page");
+  assert.equal(unresolved?.reason, "ambiguous-module");
+  assert.deepEqual(unresolved?.candidates, [
+    "packages/one/package.json",
+    "packages/two/package.json",
+  ]);
+  assert.equal(graph.edges.some((edge) => edge.type === "ROUTE_RENDERS_COMPONENT"), false);
+});
+
+test("reports configured alias failures and malformed configuration without crashing", async () => {
+  const { resolution } = await analyzeFiles({
+    "tsconfig.json": '{ "compilerOptions": { "paths": { "@broken/*": ["missing/*"], "@outside/*": ["../outside/*"] } } }',
+    "nested/jsconfig.json": '{ "compilerOptions": ',
+    "src/use.ts": [
+      'import { missing } from "@broken/api";',
+      'import { outside } from "@outside/api";',
+      "export function use() { missing(); outside(); }",
+      "",
+    ].join("\n"),
+  });
+
+  assert.equal(
+    resolution.unresolved.find((item) => item.localName === "missing")?.reason,
+    "configured-path-alias-target-not-found",
+  );
+  assert.equal(
+    resolution.unresolved.find((item) => item.localName === "outside")?.reason,
+    "configured-path-alias-outside-repository",
+  );
+  assert.equal(resolution.configurationErrors.length, 1);
+  assert.equal(resolution.configurationErrors[0]?.path, "nested/jsconfig.json");
+});
+
 async function analyzeFiles(files: Record<string, string>): Promise<{
   resolution: ProjectSymbolResolutionManifest;
   graph: ProductEvidenceGraph;
@@ -302,7 +513,9 @@ async function analyzeFiles(files: Record<string, string>): Promise<{
   const calls = analyzeFunctionCalls(sources);
   const http = analyzeHttpRequests(sources, calls);
   const graphql = analyzeGraphqlOperations(sources, calls);
+  const inputsBeforeResolution = JSON.stringify({ inventory, sources, calls });
   const resolution = resolveProjectSymbols(inventory, sources, calls);
+  assert.equal(JSON.stringify({ inventory, sources, calls }), inputsBeforeResolution);
   const graph = buildProductEvidenceGraph({
     inventory,
     sources,

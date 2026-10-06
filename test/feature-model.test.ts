@@ -86,6 +86,82 @@ test("uses deterministic naming priority and preserves same-route state identity
   assert.equal(loginFeatures.every((item) => item.nameSource.type === "runtime-heading"), true);
 });
 
+test("derives selected parameterized route identity from literals and stable bindings", () => {
+  const input = routeIdentityFixture(["/onboard/:page", "/:section"], [
+    ["state-mail", "https://app.test/#/onboard/mailserver"],
+    ["state-timesheet", "https://app.test/#/timesheet"],
+  ]);
+  const before = JSON.stringify(input);
+  const first = buildFeatureModel(input);
+  const second = buildFeatureModel(input);
+  assert.deepEqual(second, first);
+  assert.equal(JSON.stringify(input), before);
+
+  const settings = getFeaturesByRoute(first, "/onboard/:page")[0]!;
+  assert.equal(settings.name, "Onboard / Mailserver");
+  assert.equal(settings.nameSource.type, "route-bound-value");
+  assert.equal(settings.routeIdentity?.staticRoutePattern, "/onboard/:page");
+  assert.deepEqual(settings.routeIdentity?.runtimePaths, ["/onboard/mailserver"]);
+  assert.deepEqual(settings.routeIdentity?.bindings.map((item) => [item.parameter, item.value, item.classification]),
+    [["page", "mailserver", "stable-slug"]]);
+
+  const timesheet = getFeaturesByRoute(first, "/:section")[0]!;
+  assert.equal(timesheet.name, "Timesheet");
+  assert.equal(timesheet.nameSource.type, "route-bound-value");
+
+  const root = buildFeatureModel(routeIdentityFixture(["/"], [["state-root", "https://app.test/#/"]])).features[0]!;
+  assert.equal(root.name, "Root");
+  assert.equal(root.nameSource.type, "route-literal");
+});
+
+test("uses stable runtime structure while excluding opaque ticket identifiers and grouping instances", () => {
+  const input = routeIdentityFixture(["/:type/:id/:page"], [
+    ["state-ticket-a", "https://app.test/#/tickets/123456/ticket"],
+    ["state-ticket-b", "https://app.test/#/tickets/987654/ticket"],
+  ]);
+  const model = buildFeatureModel(input);
+  const features = getFeaturesByRoute(model, "/:type/:id/:page");
+  assert.equal(features.length, 1);
+  const feature = features[0]!;
+  assert.equal(feature.name, "Tickets / Ticket");
+  assert.equal(feature.nameSource.type, "runtime-route-structure");
+  assert.equal(feature.runtimeStates.length, 2);
+  assert.deepEqual(feature.routeIdentity?.runtimePaths, ["/tickets/[opaque]/ticket"]);
+  assert.equal(feature.routeIdentity?.bindings.filter((item) => item.parameter === "id")
+    .every((item) => item.classification === "opaque-identifier" && item.value === undefined), true);
+  assert.doesNotMatch(feature.id + feature.name + JSON.stringify(feature.routeIdentity), /123456|987654/);
+});
+
+test("never names features from numeric, UUID, hash-like, or redacted parameter values", () => {
+  const input = routeIdentityFixture(["/tickets/:id"], [
+    ["state-number", "https://app.test/#/tickets/123456"],
+    ["state-uuid", "https://app.test/#/tickets/550e8400-e29b-41d4-a716-446655440000"],
+    ["state-hash", "https://app.test/#/tickets/a4d91f3028c74011bb93"],
+    ["state-redacted", "https://app.test/#/tickets/%5Bredacted%5D"],
+  ]);
+  const feature = getFeaturesByRoute(buildFeatureModel(input), "/tickets/:id")[0]!;
+  assert.equal(feature.name, "Tickets");
+  assert.equal(feature.nameSource.type, "route-literal");
+  assert.equal(feature.runtimeStates.length, 4);
+  assert.equal(feature.routeIdentity?.bindings.every((item) => item.value === undefined), true);
+  assert.deepEqual([...new Set(feature.routeIdentity?.bindings.map((item) => item.classification))].sort(),
+    ["opaque-identifier", "redacted"]);
+});
+
+test("preserves ambiguous route ownership and existing runtime heading precedence", () => {
+  const input = routeIdentityFixture(["/:page", "/:section"], [
+    ["state-ambiguous", "https://app.test/#/timesheet"],
+  ], true);
+  const model = buildFeatureModel(input);
+  const runtime = model.features.find((item) => item.runtimeStates.includes("state-ambiguous"))!;
+  assert.equal(runtime.name, "Timesheet");
+  assert.equal(runtime.nameSource.type, "runtime-heading");
+  assert.equal(runtime.routeIdentity, undefined);
+  assert.ok(input.reconciliation.ambiguous.some((item) => item.domain === "route" && item.runtime.length > 0));
+  assert.equal(getFeaturesByRoute(model, "/:page")[0]?.evidenceStatus.runtime, false);
+  assert.equal(getFeaturesByRoute(model, "/:section")[0]?.evidenceStatus.runtime, false);
+});
+
 test("does not create features for helpers or API wrappers and leaves noise and ambiguity unassigned", () => {
   const model = buildFeatureModel(fixture());
   assert.equal(model.features.some((item) => item.name === "orphanHelper" || item.name === "GET /api/orphan"), false);
@@ -221,6 +297,21 @@ function fixture() {
   };
   const reconciliation = reconcileProductEvidence({ staticGraph, runtimeDiscovery });
   return { staticGraph, runtimeDiscovery, reconciliation };
+}
+
+function routeIdentityFixture(patterns: string[], states: Array<[string, string]>, withHeadings = false) {
+  const nodes = patterns.map((path, index) => staticNode(`identity-route-${index}`, "route", path, { path: value(path) }));
+  const runtimeStates = states.map(([id, url]) => state(id, url, id, withHeadings
+    ? [element(`heading-${id}`, "h1", "heading", "Timesheet", "Timesheet")] : [], []));
+  const staticGraph: ProductEvidenceGraph = { root: "/identity-fixture", nodes, edges: [], unresolved: [] };
+  const runtimeDiscovery: RuntimeNavigationDiscoveryGraph = {
+    startUrl: states[0]?.[1] ?? "https://app.test/", startOrigin: "https://app.test", allowedOrigins: ["https://app.test"],
+    limits: { maxDepth: 1, maxStates: 10, maxTransitions: 10, maxTargetsPerState: 10 }, nodes: runtimeStates,
+    transitions: [], skippedTargets: [], stopReasons: ["completed"], summary: { statesDiscovered: runtimeStates.length,
+      transitionsObserved: 0, failedTransitions: 0, targetsSkipped: 0, blocked: 0, unknown: 0, boundaryStates: 0,
+      mutationStopBranches: 0, maxDepthReached: 0 },
+  };
+  return { staticGraph, runtimeDiscovery, reconciliation: reconcileProductEvidence({ staticGraph, runtimeDiscovery }) };
 }
 
 function staticNode(id: string, type: ProductEvidenceNode["type"], label: string, data: Record<string, unknown>): ProductEvidenceNode {

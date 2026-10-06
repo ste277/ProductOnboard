@@ -48,6 +48,70 @@ test("supports exact, hash, parameterized, multiple-state, static-only, runtime-
   assert.doesNotMatch(JSON.stringify(manifest), /private-token/);
 });
 
+test("selects the unique most-specific compatible route and explains suppressed broad matches", () => {
+  const input = routeFixture(["/foo/bar", "/foo/:id", "/:section/:id", "/*"],
+    ["https://example.test/#/foo/bar?tab=open"]);
+  const manifest = reconcileProductEvidence(input);
+  const match = manifest.matches.find((item) => item.domain === "route")!;
+  assert.equal(match.static[0]?.nodeId, "route-0");
+  assert.equal(match.strength, "exact");
+  assert.deepEqual(match.reasons, ["hash-route-match", "unique-most-specific-route", "less-specific-compatible-routes-suppressed"]);
+  assert.equal(match.route?.runtimeUrl, "https://example.test/#/foo/bar?tab=open");
+  assert.equal(match.route?.normalizedApplicationPath, "/foo/bar");
+  assert.deepEqual(match.route?.candidates.map((item) => [item.staticRoutePattern, item.selection]), [
+    ["/foo/bar", "selected"], ["/foo/:id", "compatible-but-less-specific"],
+    ["/:section/:id", "compatible-but-less-specific"], ["/*", "compatible-but-less-specific"],
+  ]);
+});
+
+test("uses positional structural dominance and preserves equal-specificity ambiguity", () => {
+  const specific = reconcileProductEvidence(routeFixture(
+    ["/tickets/view/:id", "/tickets/:section/:id", "/:module/:section/:id", "/*"],
+    ["https://example.test/tickets/view/123"]));
+  assert.equal(specific.matches[0]?.static[0]?.nodeId, "route-0");
+  assert.deepEqual(specific.matches[0]?.route?.candidates[0]?.specificity.segmentConstraints,
+    ["literal", "literal", "parameter"]);
+
+  const equal = reconcileProductEvidence(routeFixture(["/foo/:id", "/:type/bar", "/*"],
+    ["https://example.test/foo/bar"]));
+  const ambiguous = equal.ambiguous.find((item) => item.runtime.some((ref) => ref.stateId === "state-0"))!;
+  assert.deepEqual(ambiguous.static.map((item) => item.nodeId), ["route-0", "route-1"]);
+  assert.deepEqual(ambiguous.route?.candidates.map((item) => item.selection),
+    ["equally-specific", "equally-specific", "compatible-but-less-specific"]);
+});
+
+test("handles wildcard-only, root, runtime-only, static-only, fragments, trailing slashes, and immutable inputs", () => {
+  const input = routeFixture(["/*", "/", "/unseen"], [
+    "https://example.test/anything/deep/", "https://example.test/", "https://example.test/page#main",
+    "https://example.test/missing",
+  ]);
+  const before = JSON.stringify(input);
+  const first = reconcileProductEvidence(input);
+  const second = reconcileProductEvidence(input);
+  assert.deepEqual(second, first);
+  assert.equal(JSON.stringify(input), before);
+  assert.equal(first.matches.find((item) => item.runtime[0]?.stateId === "state-0")?.static[0]?.nodeId, "route-0");
+  assert.equal(first.matches.find((item) => item.runtime[0]?.stateId === "state-1")?.static[0]?.nodeId, "route-1");
+  assert.equal(first.matches.find((item) => item.runtime[0]?.stateId === "state-2")?.route?.normalizedApplicationPath, "/page");
+  assert.equal(first.matches.find((item) => item.runtime[0]?.stateId === "state-2")?.static[0]?.nodeId, "route-0");
+  assert.equal(first.matches.find((item) => item.runtime[0]?.stateId === "state-3")?.static[0]?.nodeId, "route-0");
+  assert.ok(first.staticOnly.some((item) => item.static[0]?.nodeId === "route-2"));
+
+  const noWildcard = reconcileProductEvidence(routeFixture(["/known"], ["https://example.test/missing"]));
+  assert.equal(noWildcard.runtimeOnly[0]?.route?.normalizedApplicationPath, "/missing");
+  assert.equal(noWildcard.staticOnly[0]?.static[0]?.nodeId, "route-0");
+});
+
+test("does not use parameter names or runtime identifier values as specificity", () => {
+  const manifest = reconcileProductEvidence(routeFixture(["/tickets/:ticketId", "/tickets/:id"], [
+    "https://example.test/#/tickets/111", "https://example.test/#/tickets/999",
+  ]));
+  assert.equal(manifest.matches.filter((item) => item.domain === "route").length, 0);
+  assert.equal(manifest.ambiguous.filter((item) => item.runtime.length > 0).length, 2);
+  assert.ok(manifest.ambiguous.filter((item) => item.runtime.length > 0)
+    .every((item) => item.route?.candidates.every((candidate) => candidate.selection === "equally-specific")));
+});
+
 test("matches semantic elements and strong candidates only inside route context and preserves ambiguity", () => {
   const { staticGraph, runtime } = fixture();
   const manifest = reconcileProductEvidence({ staticGraph, runtimeDiscovery: runtime });
@@ -58,6 +122,45 @@ test("matches semantic elements and strong candidates only inside route context 
   assert.ok(manifest.staticOnly.some((item) => item.static.some((ref) => ref.nodeId === "ui-hidden")));
   assert.ok(manifest.staticOnly.some((item) => item.static.some((ref) => ref.nodeId === "ui-dynamic")));
   assert.ok(manifest.runtimeOnly.some((item) => item.runtime.some((ref) => ref.candidateId === "candidate-generated")));
+});
+
+test("scopes exact UI matching to selected routes and retains ambiguity, repetition, and visual provenance", () => {
+  const { staticGraph, runtime } = contextualUiFixture();
+  const manifest = reconcileProductEvidence({ staticGraph, runtimeDiscovery: runtime });
+  const settingsSave = manifest.matches.filter((item) => item.domain === "ui" &&
+    item.static[0]?.nodeId === "ui-settings-save");
+  assert.equal(settingsSave.length, 2);
+  assert.deepEqual(settingsSave.map((item) => item.runtime[0]?.elementId).sort(), ["runtime-save-a", "runtime-save-b"]);
+  assert.ok(settingsSave.every((item) => item.uiContext?.staticRouteId === "route-context-settings" &&
+    item.uiContext.candidates[0]?.reasons.includes("exact-accessible-name")));
+  assert.deepEqual(settingsSave[0]?.uiContext?.candidates[0]?.staticComponentPath, [
+    "component-context-settings",
+    "component-context-settings-child",
+  ]);
+  assert.equal(settingsSave.some((item) => item.static.some((ref) => ref.nodeId === "ui-tickets-save")), false);
+
+  const email = assertMatch(manifest, "ui", "ui-settings-email", "exact-label");
+  assert.equal(email.runtime[0]?.elementId, "runtime-email");
+  assert.equal(email.uiContext?.runtimeTargetId, "runtime-email");
+  const cancel = manifest.ambiguous.find((item) => item.domain === "ui" &&
+    item.runtime[0]?.elementId === "runtime-cancel")!;
+  assert.deepEqual(cancel.static.map((item) => item.nodeId), ["ui-settings-cancel-a", "ui-settings-cancel-b"]);
+  assert.ok(cancel.uiContext?.candidates.every((item) => item.selection === "equally-compatible"));
+  const placeholder = manifest.ambiguous.find((item) => item.domain === "ui" &&
+    item.runtime[0]?.elementId === "runtime-search")!;
+  assert.ok(placeholder.uiContext?.candidates.every((item) => item.reasons.includes("exact-placeholder")));
+
+  assert.ok(manifest.runtimeOnly.some((item) => item.runtime[0]?.elementId === "runtime-role-mismatch" &&
+    item.reasons.includes("no-compatible-static-ui")));
+  assert.ok(manifest.runtimeOnly.some((item) => item.runtime[0]?.elementId === "runtime-no-context" &&
+    item.reasons.includes("insufficient-static-ui-context")));
+  assert.ok(manifest.runtimeOnly.some((item) => item.runtime[0]?.elementId === "runtime-ambiguous-route" &&
+    item.reasons.includes("ambiguous-route-context")));
+  assert.ok(manifest.staticOnly.some((item) => item.static[0]?.nodeId === "ui-orphan-save"));
+  assert.ok(manifest.uiContextMetrics.runtimeUiWithEligibleStaticContext > 0);
+  assert.ok(manifest.uiContextMetrics.runtimeUiWithoutStaticContext > 0);
+  assert.equal(manifest.uiContextMetrics.uniqueMatches, 4);
+  assert.equal(manifest.uiContextMetrics.ambiguousMatches, 2);
 });
 
 test("reconciles navigation destinations and labels while retaining same-URL transitions", () => {
@@ -124,6 +227,9 @@ test("validation rejects duplicate IDs, missing references, and impossible statu
   const impossible: ReconciliationManifest = structuredClone(manifest);
   impossible.staticOnly[0]!.runtime.push({ stateId: "state-home" });
   assert.throws(() => validateReconciliationManifest(impossible, staticGraph, runtime), /invalid references/);
+  const invalidRoute: ReconciliationManifest = structuredClone(manifest);
+  invalidRoute.matches.find((item) => item.domain === "route")!.route!.candidates[0]!.staticRouteId = "missing-route";
+  assert.throws(() => validateReconciliationManifest(invalidRoute, staticGraph, runtime), /Missing route candidate/);
 });
 
 function assertMatch(manifest: ReconciliationManifest, domain: string, staticId: string, reason: string) {
@@ -134,6 +240,19 @@ function assertMatch(manifest: ReconciliationManifest, domain: string, staticId:
   assert.ok(item.strength);
   assert.ok(item.static.length && item.runtime.length);
   return item;
+}
+
+function routeFixture(patterns: string[], urls: string[]): { staticGraph: ProductEvidenceGraph; runtimeDiscovery: RuntimeNavigationDiscoveryGraph } {
+  const nodes = patterns.map((path, index) => staticNode(`route-${index}`, "route", path,
+    { path: { kind: "static", value: path } }));
+  const states = urls.map((url, index) => state(`state-${index}`, url, `State ${index}`, 0, [], [], [], []));
+  return { staticGraph: { root: "/route-fixture", nodes, edges: [], unresolved: [] }, runtimeDiscovery: {
+    startUrl: urls[0] ?? "https://example.test/", startOrigin: "https://example.test",
+    allowedOrigins: ["https://example.test"], limits: { maxDepth: 1, maxStates: 20, maxTransitions: 20, maxTargetsPerState: 10 },
+    nodes: states, transitions: [], skippedTargets: [], stopReasons: ["completed"],
+    summary: { statesDiscovered: states.length, transitionsObserved: 0, failedTransitions: 0, targetsSkipped: 0,
+      blocked: 0, unknown: 0, boundaryStates: 0, mutationStopBranches: 0, maxDepthReached: 0 },
+  } };
 }
 
 function fixture(): { staticGraph: ProductEvidenceGraph; runtime: RuntimeNavigationDiscoveryGraph } {
@@ -215,6 +334,58 @@ function fixture(): { staticGraph: ProductEvidenceGraph; runtime: RuntimeNavigat
     stopReasons: ["completed"], summary: { statesDiscovered: 6, transitionsObserved: 2,
       failedTransitions: 0, targetsSkipped: 0, blocked: 0, unknown: 0, boundaryStates: 1,
       mutationStopBranches: 1, maxDepthReached: 1 },
+  } };
+}
+
+function contextualUiFixture(): { staticGraph: ProductEvidenceGraph; runtime: RuntimeNavigationDiscoveryGraph } {
+  const nodes: ProductEvidenceNode[] = [
+    staticNode("route-context-settings", "route", "/settings", { path: { kind: "static", value: "/settings" } }),
+    staticNode("route-context-tickets", "route", "/tickets", { path: { kind: "static", value: "/tickets" } }),
+    staticNode("route-context-one", "route", "/:one", { path: { kind: "static", value: "/:one" } }),
+    staticNode("route-context-two", "route", "/:two", { path: { kind: "static", value: "/:two" } }),
+    staticNode("component-context-settings", "component", "Settings", {}),
+    staticNode("component-context-settings-child", "component", "SettingsChild", {}),
+    staticNode("component-context-tickets", "component", "Tickets", {}),
+    staticNode("ui-settings-save", "ui-element", 'button "Save"', { name: "button", props: [] }),
+    staticNode("ui-tickets-save", "ui-element", 'button "Save"', { name: "button", props: [] }),
+    staticNode("ui-settings-email", "ui-element", "input", { name: "input", props: [prop("label", "Email")] }),
+    staticNode("ui-settings-cancel-a", "ui-element", 'button "Cancel"', { name: "button", props: [] }),
+    staticNode("ui-settings-cancel-b", "ui-element", 'button "Cancel"', { name: "button", props: [] }),
+    staticNode("ui-settings-search-a", "ui-element", "input", { name: "input", props: [prop("placeholder", "Search")] }),
+    staticNode("ui-settings-search-b", "ui-element", "input", { name: "input", props: [prop("placeholder", "Search")] }),
+    staticNode("ui-settings-mismatch", "ui-element", 'input "Mismatch"', { name: "input", props: [] }),
+    staticNode("ui-orphan-save", "ui-element", 'button "Save"', { name: "button", props: [] }),
+  ];
+  const edges: ProductEvidenceEdge[] = [
+    edge("context-render-settings", "ROUTE_RENDERS_COMPONENT", "route-context-settings", "component-context-settings"),
+    edge("context-render-settings-child", "COMPONENT_RENDERS_COMPONENT", "component-context-settings",
+      "component-context-settings-child"),
+    edge("context-render-tickets", "ROUTE_RENDERS_COMPONENT", "route-context-tickets", "component-context-tickets"),
+    ...["ui-settings-save", "ui-settings-email", "ui-settings-cancel-a", "ui-settings-cancel-b",
+      "ui-settings-search-a", "ui-settings-search-b", "ui-settings-mismatch"]
+      .map((id) => edge(`context-contains-${id}`, "CONTAINS_ELEMENT", "component-context-settings-child", id)),
+    edge("context-contains-ticket-save", "CONTAINS_ELEMENT", "component-context-tickets", "ui-tickets-save"),
+  ];
+  const settings = state("state-context-settings", "https://app.test/settings", "Settings", 0, [
+    element("runtime-save-a", "button", "button", "Save", "Save"),
+    element("runtime-save-b", "button", "button", "Save", "Save"),
+    element("runtime-email", "input", "textbox", "Email", ""),
+    element("runtime-cancel", "button", "button", "Cancel", "Cancel"),
+    element("runtime-search", "input", "textbox", "", "", "", "Search"),
+    element("runtime-role-mismatch", "button", "button", "Mismatch", "Mismatch"),
+  ], [], [], []);
+  const tickets = state("state-context-tickets", "https://app.test/tickets", "Tickets", 0,
+    [element("runtime-ticket-save", "button", "button", "Save", "Save")], [], [], []);
+  const noContext = state("state-context-none", "https://app.test/no/context", "None", 0,
+    [element("runtime-no-context", "button", "button", "Save", "Save")], [], [], []);
+  const ambiguous = state("state-context-ambiguous", "https://app.test/dynamic", "Dynamic", 0,
+    [element("runtime-ambiguous-route", "button", "button", "Save", "Save")], [], [], []);
+  return { staticGraph: { root: "/context", nodes, edges, unresolved: [] }, runtime: {
+    startUrl: settings.url, startOrigin: "https://app.test", allowedOrigins: ["https://app.test"],
+    limits: { maxDepth: 1, maxStates: 10, maxTransitions: 10, maxTargetsPerState: 10 },
+    nodes: [settings, tickets, noContext, ambiguous], transitions: [], skippedTargets: [], stopReasons: ["completed"],
+    summary: { statesDiscovered: 4, transitionsObserved: 0, failedTransitions: 0, targetsSkipped: 0, blocked: 0,
+      unknown: 0, boundaryStates: 0, mutationStopBranches: 0, maxDepthReached: 0 },
   } };
 }
 

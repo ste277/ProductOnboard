@@ -52,6 +52,7 @@ beforeEach(async () => {
       "<!doctype html><title>Profile</title><h1>Profile</h1>");
     if (url.pathname === "/mutation") return html(response,
       "<!doctype html><title>Mutation State</title><h1>Mutation State</h1><a href='/dashboard'>Should Not Expand</a>");
+    if (url.pathname === "/ranked") return html(response, rankedFixture());
     return html(response, homeFixture(boundaryUrl));
   });
   await listen(server);
@@ -120,6 +121,30 @@ test("enforces depth, state, transition, and per-state target limits determinist
   assert.ok(transitionLimited.stopReasons.includes("max-transitions"));
   const targetLimited = await discover({ maxDepth: 1, maxStates: 20, maxTransitions: 20, maxTargetsPerState: 1 });
   assert.ok(targetLimited.skippedTargets.some((item) => item.reasons.includes("target-limit")));
+});
+
+test("prioritizes explicit and structural product navigation before utility and unknown targets", async () => {
+  const limits = { maxDepth: 1, maxStates: 5, maxTransitions: 6, maxTargetsPerState: 2 };
+  const graph = await discoverRuntimeNavigation({ startUrl: `${baseUrl}/ranked`, outputDirectory: artifacts("ranked"),
+    limits, settleTimeoutMs: 300, readinessTimeoutMs: 500 });
+  assert.equal(graph.transitions[0]?.targetMetadata?.priority, "explicit-navigation");
+  assert.equal(graph.transitions[0]?.target?.accessibleName, "Dashboard");
+  assert.equal(graph.transitions[1]?.targetMetadata?.priority, "strong-custom-navigation");
+  assert.equal(graph.transitions[1]?.target?.source, "interaction-candidate");
+  assert.equal(graph.transitions[1]?.target?.source === "interaction-candidate" && graph.transitions[1].target.text, "Assets");
+  assert.equal(graph.transitions[1]?.safety.decision, "allowed");
+  assert.equal(graph.transitions[1]?.transition?.kind, "hash-change");
+  assert.ok(graph.nodes.some((node) => node.url === `${baseUrl}/ranked#/assets`));
+  assert.equal(graph.nodes.find((node) => node.url === `${baseUrl}/ranked#/assets`)?.stopReasons.includes("mutation-observed"), false);
+  const skip = graph.skippedTargets.find((item) => item.text === "Skip to content");
+  assert.equal(skip?.targetMetadata?.classification, "utility-navigation");
+  assert.ok(graph.skippedTargets.some((item) => item.text === "Delete account" &&
+    item.targetMetadata?.priority === "strong-custom-navigation"));
+
+  const again = await discoverRuntimeNavigation({ startUrl: `${baseUrl}/ranked`, outputDirectory: artifacts("ranked-again"),
+    limits, settleTimeoutMs: 300, readinessTimeoutMs: 500 });
+  assert.deepEqual(again.transitions.map((item) => [item.target?.id, item.targetMetadata]),
+    graph.transitions.map((item) => [item.target?.id, item.targetMetadata]));
 });
 
 test("mutation traffic records warnings, baseline evidence, and stops branch expansion", async () => {
@@ -259,6 +284,27 @@ function homeFixture(external: string): string {
       });
       document.querySelector('#technician').addEventListener('click', () => location.href = ${JSON.stringify(`${external}/auth-boundary`)});
       document.querySelector('#reports').addEventListener('click', () => fetch('/api/surprise', { method: 'POST', body: 'private' }));
+    </script>`;
+}
+
+function rankedFixture(): string {
+  return `<!doctype html><title>Ranked</title>
+    <a href="#main">Skip to content</a><a href="/dashboard">Dashboard</a>
+    <img role="img" aria-label="Company"><img role="img" aria-label="Decoration">
+    <button>Ordinary Action</button><div id="cursor" style="cursor:pointer">Cursor only</div>
+    <div id="product-nav">
+      <div id="assets" style="cursor:pointer">Assets</div>
+      <div id="tickets" style="cursor:pointer">Tickets</div>
+      <div id="delete" style="cursor:pointer">Delete account</div>
+    </div><main id="main"><h1>Home</h1></main>
+    <script>
+      document.querySelector('#assets').addEventListener('click', () => {
+        location.hash = '/assets'; document.querySelector('main').innerHTML = '<h1>Assets</h1>';
+        fetch('/api/background', { method: 'POST' });
+      });
+      document.querySelector('#tickets').addEventListener('click', () => { location.hash = '/tickets'; });
+      document.querySelector('#delete').addEventListener('click', () => fetch('/deleted', { method: 'DELETE' }));
+      fetch('/api/background', { method: 'POST' });
     </script>`;
 }
 
