@@ -59,8 +59,30 @@ beforeEach(async () => {
     if (requestUrl.pathname === "/long-lived") {
       response.writeHead(200, { "content-type": "text/html" });
       response.end(`<!doctype html><title>Streaming Tickets</title>
-        <h1>Streaming</h1><button>Refresh</button>
+        <h1>Streaming tickets are ready</h1><button>Refresh</button>
         <script>fetch('/api/stream');</script>`);
+      return;
+    }
+    if (requestUrl.pathname === "/delayed-ready") {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end(`<!doctype html><title>Delayed</title><main id="app"><span>Loading...</span></main>
+        <script>setTimeout(() => { document.querySelector('#app').innerHTML =
+          '<nav><button>Settings</button></nav><h1>Dashboard ready for work</h1>'; }, 3200);</script>`);
+      return;
+    }
+    if (requestUrl.pathname === "/spinner-only") {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<!doctype html><title>Loading</title><div role='progressbar'>Loading...</div>");
+      return;
+    }
+    if (requestUrl.pathname === "/text-only") {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<!doctype html><title>Text</title><main>Application content has loaded, but no controls exist.</main>");
+      return;
+    }
+    if (requestUrl.pathname === "/never-ready") {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<!doctype html><title>Empty</title><main></main>");
       return;
     }
     if (requestUrl.pathname === "/candidates") {
@@ -80,7 +102,7 @@ beforeEach(async () => {
     }
     if (requestUrl.pathname === "/login") {
       response.writeHead(200, { "content-type": "text/html" });
-      response.end("<!doctype html><title>Login</title><h1>Login</h1>");
+      response.end("<!doctype html><title>Login</title><h1>Login to continue</h1><button>Sign in</button>");
       return;
     }
     response.writeHead(200, { "content-type": "text/html" });
@@ -135,6 +157,8 @@ test("captures visible UI, accessibility, layout, network, errors, and a viewpor
   assert.equal(first.navigation.redirected, false);
   assert.equal(first.status, "complete");
   assert.equal(first.readiness.status, "ready");
+  assert.equal(first.readiness.reason, "semantic-ui");
+  assert.ok((first.readiness.elapsedMs ?? -1) >= 0);
   assert.equal(first.page.title, "Tickets");
   assert.deepEqual(first.viewport, DEFAULT_RUNTIME_VIEWPORT);
   assert.match(first.capturedAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -227,10 +251,12 @@ test("captures rendered 404 and 500 pages as successful browser evidence", async
   const missing = await captureRuntimePage({
     url: `${baseUrl}/not-found`,
     outputDirectory: artifactDirectory("404"),
+    readinessTimeoutMs: 300,
   });
   const failed = await captureRuntimePage({
     url: `${baseUrl}/server-error`,
     outputDirectory: artifactDirectory("500"),
+    readinessTimeoutMs: 300,
   });
   assert.equal(missing.navigation.status, 404);
   assert.equal(missing.page.title, "Missing");
@@ -264,11 +290,11 @@ test("captures partial UI, ARIA, screenshot, network, and errors during persiste
     outputDirectory: artifactDirectory("polling"),
     readinessTimeoutMs: 700,
   });
-  assert.equal(capture.status, "partial");
+  assert.equal(capture.status, "complete");
   assert.equal(capture.navigation.success, true);
-  assert.equal(capture.readiness.status, "partial");
-  assert.equal(capture.readiness.reason, "network-active");
-  assert.equal(capture.stages.readiness.status, "partial");
+  assert.equal(capture.readiness.status, "ready");
+  assert.equal(capture.readiness.reason, "semantic-ui");
+  assert.equal(capture.stages.readiness.status, "complete");
   assert.equal(capture.finalUrl, `${baseUrl}/polling`);
   assert.equal(capture.page.title, "Polling Tickets");
   assert.ok(capture.elements.some((element) => element.accessibleName === "Create Ticket"));
@@ -289,12 +315,52 @@ test("captures a rendered page while a request remains open", async () => {
     outputDirectory: artifactDirectory("long-lived"),
     readinessTimeoutMs: 500,
   });
-  assert.equal(capture.status, "partial");
-  assert.equal(capture.readiness.reason, "network-active");
+  assert.equal(capture.status, "complete");
+  assert.equal(capture.readiness.reason, "semantic-ui");
   assert.equal(capture.page.title, "Streaming Tickets");
   assert.ok(capture.elements.some((element) => element.accessibleName === "Refresh"));
   assert.ok(capture.network.some((item) => item.url.endsWith("/api/stream")));
   assert.equal(capture.screenshot.captured, true);
+});
+
+test("waits for semantically ready application UI after a 3–5 second render delay", async () => {
+  const capture = await captureRuntimePage({ url: `${baseUrl}/delayed-ready`,
+    outputDirectory: artifactDirectory("delayed-ready"), readinessTimeoutMs: 5_000 });
+  assert.equal(capture.status, "complete");
+  assert.equal(capture.readiness.status, "ready");
+  assert.equal(capture.readiness.reason, "semantic-ui");
+  assert.ok((capture.readiness.elapsedMs ?? 0) >= 3_000);
+  assert.ok((capture.readiness.elapsedMs ?? Infinity) < 5_000);
+  assert.ok(capture.elements.some((item) => item.accessibleName === "Settings"));
+});
+
+test("does not accept a loading spinner or visible text without controls", async () => {
+  for (const path_ of ["spinner-only", "text-only"]) {
+    const capture = await captureRuntimePage({ url: `${baseUrl}/${path_}`,
+      outputDirectory: artifactDirectory(path_), readinessTimeoutMs: 400 });
+    assert.equal(capture.status, "partial");
+    assert.equal(capture.readiness.status, "partial");
+    assert.equal(capture.readiness.reason, "semantic-timeout");
+    assert.equal(capture.stages.readiness.status, "partial");
+    assert.ok((capture.readiness.elapsedMs ?? 0) >= 400);
+  }
+});
+
+test("preserves partial evidence and diagnostics when semantic readiness never arrives", async () => {
+  const capture = await captureRuntimePage({ url: `${baseUrl}/never-ready`,
+    outputDirectory: artifactDirectory("never-ready"), readinessTimeoutMs: 350 });
+  assert.equal(capture.status, "partial");
+  assert.equal(capture.readiness.reason, "semantic-timeout");
+  assert.equal(capture.readiness.timeoutMs, 350);
+  assert.ok((capture.readiness.elapsedMs ?? 0) >= 350);
+  assert.deepEqual(capture.readiness.observation, { visibleTextLength: 0, interactiveControlCount: 0,
+    navigationControlCount: 0, stablePolls: 2 });
+  assert.equal(capture.screenshot.captured, true);
+});
+
+test("bounds configured readiness timeouts", async () => {
+  await assert.rejects(captureRuntimePage({ url: `${baseUrl}/tickets`, readinessTimeoutMs: 30_001 }),
+    /readinessTimeoutMs must be an integer from 1 to 30000/);
 });
 
 test("preserves other evidence when screenshot extraction fails", async () => {
@@ -308,7 +374,7 @@ test("preserves other evidence when screenshot extraction fails", async () => {
   assert.equal(capture.navigation.success, true);
   assert.equal(capture.finalUrl, `${baseUrl}/login`);
   assert.equal(capture.page.title, "Login");
-  assert.match(capture.accessibility.snapshot, /heading "Login"/);
+  assert.match(capture.accessibility.snapshot, /heading "Login to continue"/);
   assert.equal(capture.stages.screenshot.status, "failed");
   assert.equal(capture.screenshot.captured, false);
   assert.deepEqual(capture.issues, [{

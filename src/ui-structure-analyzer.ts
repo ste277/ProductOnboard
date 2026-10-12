@@ -232,6 +232,7 @@ function collectComponentCandidates(
   sourceFile: ts.SourceFile,
 ): ComponentCandidate[] {
   const candidates: ComponentCandidate[] = [];
+  const reactForwardRefs = readReactForwardRefBindings(sourceFile);
 
   for (const statement of sourceFile.statements) {
     if (ts.isFunctionDeclaration(statement)) {
@@ -247,6 +248,9 @@ function collectComponentCandidates(
 
     if (ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
+        const forwardRefArgument = declaration.initializer && ts.isCallExpression(declaration.initializer)
+          ? declaration.initializer.arguments[0]
+          : undefined;
         if (
           ts.isIdentifier(declaration.name) &&
           isSupportedFunction(declaration.initializer)
@@ -255,6 +259,17 @@ function collectComponentCandidates(
             name: declaration.name.text,
             declaration,
             functionLike: declaration.initializer,
+            forcedDefaultExport: false,
+          });
+        } else if (ts.isIdentifier(declaration.name) && declaration.initializer &&
+          ts.isCallExpression(declaration.initializer) &&
+          ts.isIdentifier(declaration.initializer.expression) &&
+          reactForwardRefs.has(declaration.initializer.expression.text) &&
+          forwardRefArgument && isSupportedFunction(forwardRefArgument)) {
+          candidates.push({
+            name: declaration.name.text,
+            declaration,
+            functionLike: forwardRefArgument,
             forcedDefaultExport: false,
           });
         }
@@ -277,6 +292,19 @@ function collectComponentCandidates(
   }
 
   return candidates;
+}
+
+function readReactForwardRefBindings(sourceFile: ts.SourceFile): Set<string> {
+  const result = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== "react" || !statement.importClause?.namedBindings ||
+      !ts.isNamedImports(statement.importClause.namedBindings)) continue;
+    for (const item of statement.importClause.namedBindings.elements) {
+      if ((item.propertyName?.text ?? item.name.text) === "forwardRef") result.add(item.name.text);
+    }
+  }
+  return result;
 }
 
 function findReturnedJsx(

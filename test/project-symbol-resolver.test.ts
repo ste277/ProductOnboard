@@ -384,6 +384,8 @@ test("resolves workspace package subpaths when a broader path alias target is ab
     }),
     "packages/shell/package.json": JSON.stringify({ name: "@scope/shell", private: true }),
     "packages/shell/src/Pages/AppHomePage.tsx": [
+      'import { withRouter } from "react-router-dom";',
+      'import { withLDConsumer } from "launchdarkly-react-client-sdk";',
       "function AppHomePage() { return <main>Workspace home</main>; }",
       "export default withRouter(withLDConsumer()(AppHomePage));",
       "",
@@ -420,13 +422,131 @@ test("does not unwrap unsupported component export calls", async () => {
   });
 
   assert.equal(
-    resolution.resolutions.find((item) => item.localName === "WrappedPage")?.target.name,
-    "<anonymous-default>",
+    resolution.unresolved.find((item) => item.localName === "WrappedPage")?.reason,
+    "unsupported-component-wrapper",
   );
   assert.equal(graph.edges.some((edge) => edge.type === "ROUTE_RENDERS_COMPONENT"), false);
   assert.ok(graph.unresolved.some((item) =>
     item.relationship === "ROUTE_RENDERS_COMPONENT" &&
-    item.reason === "Associated route component is not a same-file UI component"));
+    item.reason === "Module resolution failed: unsupported-component-wrapper"));
+});
+
+test("resolves origin-proven transparent wrapper exports with aliases and provenance", async () => {
+  const { resolution, graph } = await analyzeFiles({
+    "src/Page.tsx": [
+      'import { injectIntl as withIntl } from "react-intl";',
+      'import { withRouter as routed } from "react-router-dom";',
+      "function Page() { return <main>Page</main>; }",
+      "const Wrapped = withIntl(routed(Page), { forwardRef: true });",
+      "export default Wrapped;",
+      "",
+    ].join("\n"),
+    "src/App.tsx": [
+      'import Page from "./Page";',
+      'export function App() { return <Route path="/page" component={Page} />; }',
+      "",
+    ].join("\n"),
+  });
+
+  const resolved = resolution.resolutions.find((item) => item.localName === "Page");
+  assert.equal(resolved?.target.name, "Page");
+  assert.deepEqual(resolved?.evidence.filter((item) => item.kind === "component-wrapper")
+    .map((item) => [item.name, item.moduleSpecifier]), [
+    ["injectIntl", "react-intl"],
+    ["withRouter", "react-router-dom"],
+  ]);
+  assert.equal(graph.nodes.filter((node) => node.type === "component" && node.label === "Page").length, 1);
+  assert.ok(graph.edges.some((edge) => edge.type === "ROUTE_RENDERS_COMPONENT"));
+});
+
+test("resolves a locally proven router forward-ref wrapper to its extracted component", async () => {
+  const { resolution, graph } = await analyzeFiles({
+    "src/TabManager.jsx": [
+      'import { forwardRef as reactForwardRef } from "react";',
+      'import { withRouter } from "react-router-dom";',
+      "const withRouterForwardRef = (Component) => {",
+      "  const WithRouter = withRouter(({ forwardedRef, ...props }) => <Component ref={forwardedRef} {...props} />);",
+      "  return reactForwardRef((props, ref) => <WithRouter {...props} forwardedRef={ref} />);",
+      "};",
+      "const TabManagerFC = reactForwardRef((props, ref) => <main>Tabs</main>);",
+      "const TabManager = withRouterForwardRef(TabManagerFC);",
+      "export default TabManager;",
+      "",
+    ].join("\n"),
+    "src/App.tsx": [
+      'import TabManager from "./TabManager";',
+      "export function App() { return <TabManager />; }",
+      "",
+    ].join("\n"),
+  });
+
+  const resolved = resolution.resolutions.find((item) => item.localName === "TabManager");
+  assert.equal(resolved?.target.name, "TabManagerFC");
+  assert.ok(resolved?.evidence.some((item) => item.kind === "component-wrapper" &&
+    item.name === "withRouterForwardRef" && item.moduleSpecifier === "src/TabManager.jsx"));
+  assert.ok(graph.edges.some((edge) => edge.type === "COMPONENT_RENDERS_COMPONENT"));
+});
+
+test("rejects shadowed, mixed, curried, and unknown wrapper chains", async () => {
+  const { resolution, graph } = await analyzeFiles({
+    "src/Shadowed.tsx": [
+      "function injectIntl(value) { return value; }",
+      "function Shadowed() { return <main />; }",
+      "export default injectIntl(Shadowed);",
+      "",
+    ].join("\n"),
+    "src/Mixed.tsx": [
+      'import { injectIntl } from "react-intl";',
+      "function Mixed() { return <main />; }",
+      "export default injectIntl(unknownHoc(Mixed));",
+      "",
+    ].join("\n"),
+    "src/Curried.tsx": [
+      "function Curried() { return <main />; }",
+      "export default connect(mapState)(Curried);",
+      "",
+    ].join("\n"),
+    "src/App.tsx": [
+      'import Shadowed from "./Shadowed";',
+      'import Mixed from "./Mixed";',
+      'import Curried from "./Curried";',
+      "export function App() { return <><Shadowed /><Mixed /><Curried /></>; }",
+      "",
+    ].join("\n"),
+  });
+
+  for (const name of ["Shadowed", "Mixed", "Curried"]) {
+    assert.equal(resolution.unresolved.find((item) => item.localName === name)?.reason,
+      "unsupported-component-wrapper");
+    assert.ok(graph.unresolved.some((item) =>
+      item.relationship === "COMPONENT_RENDERS_COMPONENT" && item.reference === name));
+  }
+});
+
+test("reports missing and ambiguous symbols beneath a supported wrapper", async () => {
+  const { resolution } = await analyzeFiles({
+    "src/Missing.tsx": [
+      'import { injectIntl } from "react-intl";',
+      "export default injectIntl(MissingPage);",
+      "",
+    ].join("\n"),
+    "src/Ambiguous.tsx": [
+      'import { injectIntl } from "react-intl";',
+      "function Page() { return <main>One</main>; }",
+      "function Page() { return <main>Two</main>; }",
+      "export default injectIntl(Page);",
+      "",
+    ].join("\n"),
+    "src/use.ts": [
+      'import Missing from "./Missing";',
+      'import Ambiguous from "./Ambiguous";',
+      "export function use() { Missing(); Ambiguous(); }",
+      "",
+    ].join("\n"),
+  });
+
+  assert.equal(resolution.unresolved.find((item) => item.localName === "Missing")?.reason, "export-not-found");
+  assert.equal(resolution.unresolved.find((item) => item.localName === "Ambiguous")?.reason, "ambiguous-export");
 });
 
 test("keeps workspace package misses explicit and does not treat dependencies as workspaces", async () => {

@@ -15,7 +15,11 @@ import type {
 import { parseTypeScriptSource } from "./typescript-parser.js";
 
 const SUPPORTED_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"] as const;
-const SUPPORTED_COMPONENT_EXPORT_WRAPPERS = new Set(["withLDConsumer", "withRouter"]);
+const EXTERNAL_COMPONENT_WRAPPERS = new Map([
+  ["react-intl:injectIntl", { minimumArguments: 1, componentArgument: 0 }],
+  ["react-router-dom:withRouter", { minimumArguments: 1, componentArgument: 0 }],
+  ["launchdarkly-react-client-sdk:withLDConsumer", { minimumArguments: 0, componentArgument: 0, curried: true }],
+]);
 
 export type SymbolResolutionStrength = "direct" | "re-exported";
 export type SymbolResolutionKind = "import" | "namespace-member";
@@ -31,6 +35,7 @@ export type SymbolResolutionFailureReason =
   | "configured-path-alias-target-not-found"
   | "configured-path-alias-outside-repository"
   | "workspace-package-target-not-found"
+  | "unsupported-component-wrapper"
   | "dynamic-import-out-of-scope";
 
 export interface ConfiguredModuleResolution {
@@ -53,7 +58,7 @@ export interface ProjectConfigurationError {
 }
 
 export interface ModuleResolutionEvidence {
-  kind: "import" | "module" | "export" | "re-export" | "declaration" | "call" | "configuration" | "path-alias" | "workspace-package";
+  kind: "import" | "module" | "export" | "re-export" | "declaration" | "call" | "configuration" | "path-alias" | "workspace-package" | "component-wrapper";
   path: string;
   moduleSpecifier?: string;
   name?: string;
@@ -139,11 +144,20 @@ interface ExportCandidate {
   exportAll: boolean;
   location: SourceLocation;
   declaration?: DeclarationCandidate;
+  wrapperEvidence?: ModuleResolutionEvidence[];
+  unsupportedWrapper?: string;
 }
 
 interface DeclarationCandidate {
   name: string;
   location: SourceLocation;
+  wrappedLocalName?: string;
+  wrapperEvidence?: ModuleResolutionEvidence[];
+}
+
+interface ImportBinding {
+  moduleSpecifier: string;
+  importedName: string;
 }
 
 interface FileSymbols {
@@ -158,7 +172,8 @@ interface ResolvedExport {
 }
 
 interface FailedExport {
-  reason: "export-not-found" | "ambiguous-export" | "circular-re-export" | "module-not-found" | "ambiguous-module";
+  reason: "export-not-found" | "ambiguous-export" | "circular-re-export" | "module-not-found" | "ambiguous-module" |
+    "unsupported-component-wrapper";
   candidates?: string[];
   evidence: ModuleResolutionEvidence[];
 }
@@ -421,14 +436,33 @@ function resolveExport(
   );
   const results: ResolvedExport[] = [];
   let sawCycle = false;
+  let sawUnsupportedWrapper = false;
+  const ambiguousDirect: ResolvedSymbolTarget[] = [];
+  const unresolvedWrapperEvidence: ModuleResolutionEvidence[] = [];
 
   for (const entry of direct) {
-    const declaration = entry.declaration ?? findDeclaration(file, entry.localName ?? exportedName);
-    if (!declaration) continue;
+    if (entry.unsupportedWrapper) {
+      sawUnsupportedWrapper = true;
+      continue;
+    }
+    const localName = entry.localName ?? exportedName;
+    const localDeclarations = file.declarations.get(localName) ?? [];
+    if (!entry.declaration && localDeclarations.length > 1) {
+      ambiguousDirect.push(...localDeclarations.map((item) => targetForDeclaration(item, callables)));
+      unresolvedWrapperEvidence.push(...(entry.wrapperEvidence ?? []));
+      continue;
+    }
+    const initial = entry.declaration ?? findDeclaration(file, localName);
+    if (!initial) unresolvedWrapperEvidence.push(...(entry.wrapperEvidence ?? []));
+    const resolvedDeclaration = initial ? resolveWrappedDeclaration(file, initial, new Set()) : undefined;
+    if (!resolvedDeclaration) continue;
+    const { declaration, evidence: wrapperEvidence } = resolvedDeclaration;
     results.push({
       target: targetForDeclaration(declaration, callables),
       evidence: [
         { kind: "export", path: modulePath, name: exportedName, location: entry.location },
+        ...(entry.wrapperEvidence ?? []),
+        ...wrapperEvidence,
         { kind: "declaration", path: modulePath, name: declaration.name, location: declaration.location },
       ],
       reExported: false,
@@ -476,8 +510,15 @@ function resolveExport(
       candidates: unique.map((entry) => entry.target.id).sort(compareText),
       evidence: unique.flatMap((entry) => entry.evidence),
     };
+  } else if (ambiguousDirect.length > 1) {
+    result = {
+      reason: "ambiguous-export",
+      candidates: [...new Set(ambiguousDirect.map((item) => item.id))].sort(compareText),
+      evidence: unresolvedWrapperEvidence,
+    };
   } else {
-    result = { reason: sawCycle ? "circular-re-export" : "export-not-found", evidence: [] };
+    result = { reason: sawUnsupportedWrapper ? "unsupported-component-wrapper" :
+      sawCycle ? "circular-re-export" : "export-not-found", evidence: unresolvedWrapperEvidence };
   }
   cache.set(key, result);
   return result;
@@ -489,6 +530,8 @@ function readFileSymbols(
 ): FileSymbols {
   const declarations = new Map<string, DeclarationCandidate[]>();
   const exports: ExportCandidate[] = [];
+  const imports = readImportBindings(sourceFile);
+  const localWrappers = readLocalTransparentWrappers(sourceFile, imports);
 
   const addDeclaration = (name: string, node: ts.Node): DeclarationCandidate => {
     const declaration = { name, location: getLocation(node, sourceFile, file.path) };
@@ -517,6 +560,13 @@ function readFileSymbols(
       for (const item of statement.declarationList.declarations) {
         if (!ts.isIdentifier(item.name)) continue;
         const declaration = addDeclaration(item.name.text, item);
+        const wrapped = item.initializer
+          ? readTransparentWrappedIdentifier(item.initializer, sourceFile, file.path, imports, localWrappers)
+          : undefined;
+        if (wrapped && wrapped.localName !== item.name.text) {
+          declaration.wrappedLocalName = wrapped.localName;
+          declaration.wrapperEvidence = wrapped.evidence;
+        }
         if (hasModifier(statement, ts.SyntaxKind.ExportKeyword)) {
           exports.push({
             exportedName: item.name.text,
@@ -565,42 +615,164 @@ function readFileSymbols(
 
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
       const expression = unwrapParentheses(statement.expression);
-      const localName = readSupportedComponentExportIdentifier(expression);
+      const wrapped = readTransparentWrappedIdentifier(expression, sourceFile, file.path, imports, localWrappers);
+      const localName = wrapped?.localName;
       const declaration = localName ? findDeclaration({ declarations, exports }, localName) : undefined;
       exports.push({
         exportedName: "default",
         ...(localName ? { localName } : {}),
         exportAll: false,
         location: getLocation(statement, sourceFile, file.path),
-        ...(declaration ? { declaration } : {
+        ...(wrapped?.evidence.length ? { wrapperEvidence: wrapped.evidence } : {}),
+        ...(!wrapped && ts.isCallExpression(expression) ? {
+          unsupportedWrapper: expression.expression.getText(sourceFile),
+        } : declaration ? { declaration } : !wrapped ? {
           declaration: {
             name: "<anonymous-default>",
             location: getLocation(statement, sourceFile, file.path),
           },
-        }),
+        } : {}),
       });
     }
   }
   return { declarations, exports };
 }
 
-function readSupportedComponentExportIdentifier(expression: ts.Expression): string | undefined {
-  const current = unwrapParentheses(expression);
-  if (ts.isIdentifier(current)) return current.text;
-  if (!ts.isCallExpression(current) || current.arguments.length !== 1) return undefined;
-  const wrapper = readWrapperName(current.expression);
-  if (!wrapper || !SUPPORTED_COMPONENT_EXPORT_WRAPPERS.has(wrapper)) return undefined;
-  return readSupportedComponentExportIdentifier(current.arguments[0]!);
+function resolveWrappedDeclaration(
+  file: FileSymbols,
+  candidate: DeclarationCandidate,
+  visiting: Set<string>,
+): { declaration: DeclarationCandidate; evidence: ModuleResolutionEvidence[] } | undefined {
+  if (!candidate.wrappedLocalName) return { declaration: candidate, evidence: [] };
+  if (visiting.has(candidate.name)) return undefined;
+  visiting.add(candidate.name);
+  const nested = findDeclaration(file, candidate.wrappedLocalName);
+  if (!nested) return undefined;
+  const result = resolveWrappedDeclaration(file, nested, visiting);
+  return result ? {
+    declaration: result.declaration,
+    evidence: [...(candidate.wrapperEvidence ?? []), ...result.evidence],
+  } : undefined;
 }
 
-function readWrapperName(expression: ts.Expression): string | undefined {
-  const current = unwrapParentheses(expression);
-  if (ts.isIdentifier(current)) return current.text;
-  if (ts.isCallExpression(current)) {
-    const callee = unwrapParentheses(current.expression);
-    if (ts.isIdentifier(callee)) return callee.text;
+function readImportBindings(sourceFile: ts.SourceFile): Map<string, ImportBinding> {
+  const bindings = new Map<string, ImportBinding>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier) ||
+      !statement.importClause) continue;
+    const moduleSpecifier = statement.moduleSpecifier.text;
+    if (statement.importClause.name) {
+      bindings.set(statement.importClause.name.text, { moduleSpecifier, importedName: "default" });
+    }
+    const named = statement.importClause.namedBindings;
+    if (named && ts.isNamedImports(named)) {
+      for (const item of named.elements) {
+        bindings.set(item.name.text, {
+          moduleSpecifier,
+          importedName: item.propertyName?.text ?? item.name.text,
+        });
+      }
+    }
   }
-  return undefined;
+  return bindings;
+}
+
+function readLocalTransparentWrappers(
+  sourceFile: ts.SourceFile,
+  imports: Map<string, ImportBinding>,
+): Set<string> {
+  const wrappers = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || !isSupportedFunctionExpression(declaration.initializer)) continue;
+      const parameter = declaration.initializer.parameters[0]?.name;
+      if (!parameter || !ts.isIdentifier(parameter)) continue;
+      let rendersParameter = false;
+      let usesRouter = false;
+      let usesReactForwardRef = false;
+      const visit = (node: ts.Node): void => {
+        if ((ts.isJsxElement(node) && node.openingElement.tagName.getText(sourceFile) === parameter.text) ||
+          (ts.isJsxSelfClosingElement(node) && node.tagName.getText(sourceFile) === parameter.text)) {
+          rendersParameter = true;
+        }
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+          const binding = imports.get(node.expression.text);
+          if (binding?.moduleSpecifier === "react-router-dom" && binding.importedName === "withRouter") usesRouter = true;
+          if (binding?.moduleSpecifier === "react" && binding.importedName === "forwardRef") usesReactForwardRef = true;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(declaration.initializer);
+      if (rendersParameter && usesRouter && usesReactForwardRef) wrappers.add(declaration.name.text);
+    }
+  }
+  return wrappers;
+}
+
+function isSupportedFunctionExpression(node: ts.Node | undefined): node is ts.ArrowFunction | ts.FunctionExpression {
+  return Boolean(node && (ts.isArrowFunction(node) || ts.isFunctionExpression(node)));
+}
+
+function readTransparentWrappedIdentifier(
+  expression: ts.Expression,
+  sourceFile: ts.SourceFile,
+  filePath: string,
+  imports: Map<string, ImportBinding>,
+  localWrappers: Set<string>,
+): { localName: string; evidence: ModuleResolutionEvidence[] } | undefined {
+  const current = unwrapParentheses(expression);
+  if (ts.isIdentifier(current)) return { localName: current.text, evidence: [] };
+  if (!ts.isCallExpression(current)) return undefined;
+
+  const directCallee = ts.isIdentifier(unwrapParentheses(current.expression))
+    ? unwrapParentheses(current.expression) as ts.Identifier
+    : undefined;
+  let wrapperLocalName: string | undefined;
+  let component: ts.Expression | undefined;
+  let origin: string | undefined;
+  let wrapperName: string | undefined;
+
+  if (directCallee) {
+    const binding = imports.get(directCallee.text);
+    const contract = binding && EXTERNAL_COMPONENT_WRAPPERS.get(`${binding.moduleSpecifier}:${binding.importedName}`);
+    if (binding && contract && !contract.curried && current.arguments.length >= contract.minimumArguments) {
+      wrapperLocalName = directCallee.text;
+      component = current.arguments[contract.componentArgument];
+      origin = binding.moduleSpecifier;
+      wrapperName = binding.importedName;
+    } else if (localWrappers.has(directCallee.text) && current.arguments.length === 1) {
+      wrapperLocalName = directCallee.text;
+      component = current.arguments[0];
+      origin = filePath;
+      wrapperName = directCallee.text;
+    }
+  } else if (ts.isCallExpression(current.expression) &&
+    ts.isIdentifier(unwrapParentheses(current.expression.expression))) {
+    const factory = unwrapParentheses(current.expression.expression) as ts.Identifier;
+    const binding = imports.get(factory.text);
+    const contract = binding && EXTERNAL_COMPONENT_WRAPPERS.get(`${binding.moduleSpecifier}:${binding.importedName}`);
+    if (binding && contract?.curried && current.expression.arguments.length >= contract.minimumArguments &&
+      current.arguments.length === 1) {
+      wrapperLocalName = factory.text;
+      component = current.arguments[contract.componentArgument];
+      origin = binding.moduleSpecifier;
+      wrapperName = binding.importedName;
+    }
+  }
+  if (!wrapperLocalName || !component || !origin || !wrapperName) return undefined;
+  const nested = readTransparentWrappedIdentifier(component, sourceFile, filePath, imports, localWrappers);
+  if (!nested) return undefined;
+  return {
+    localName: nested.localName,
+    evidence: [{
+      kind: "component-wrapper",
+      path: filePath,
+      moduleSpecifier: origin,
+      name: wrapperName,
+      location: getLocation(current, sourceFile, filePath),
+    }, ...nested.evidence],
+  };
 }
 
 function readImports(
@@ -1045,7 +1217,7 @@ function targetForDeclaration(
   callables: Map<string, CallableRecord>,
 ): ResolvedSymbolTarget {
   const callable = callables.get(locationKey(declaration.location));
-  return callable
+  return callable && (callable.name === declaration.name || declaration.name === "<anonymous-default>")
     ? {
         kind: "callable",
         id: callable.id,

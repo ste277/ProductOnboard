@@ -11,6 +11,8 @@ import {
 } from "playwright";
 
 export const DEFAULT_RUNTIME_VIEWPORT = { width: 1440, height: 900 } as const;
+export const DEFAULT_RUNTIME_READINESS_TIMEOUT_MS = 10_000;
+export const MAX_RUNTIME_READINESS_TIMEOUT_MS = 30_000;
 
 export interface RuntimeCaptureOptions {
   url: string;
@@ -162,8 +164,10 @@ export interface RuntimeCaptureManifest {
   };
   readiness: {
     status: "ready" | "partial";
-    reason: "network-idle" | "network-active";
+    reason: "semantic-ui" | "semantic-timeout" | "network-idle" | "network-active";
     timeoutMs: number;
+    elapsedMs?: number;
+    observation?: RuntimeReadinessObservation;
   };
   stages: RuntimeCaptureStages;
   issues: RuntimeCaptureIssue[];
@@ -183,6 +187,13 @@ export interface RuntimeCaptureManifest {
     captured: boolean;
     provenance: "screenshot";
   };
+}
+
+export interface RuntimeReadinessObservation {
+  visibleTextLength: number;
+  interactiveControlCount: number;
+  navigationControlCount: number;
+  stablePolls: number;
 }
 
 export type RuntimeCaptureFailureStage =
@@ -265,7 +276,7 @@ export async function captureRuntimePage(
   const requestedUrl = sanitizeRuntimeUrl(navigationUrl);
   const outputDirectory = path.resolve(options.outputDirectory ?? "artifacts/runtime");
   const timeoutMs = options.timeoutMs ?? 30_000;
-  const readinessTimeoutMs = options.readinessTimeoutMs ?? 2_000;
+  const readinessTimeoutMs = normalizeReadinessTimeout(options.readinessTimeoutMs);
   const candidateTimeoutMs = options.candidateTimeoutMs ?? 3_000;
   let browser: Browser | undefined;
   let context: BrowserContext | undefined;
@@ -340,13 +351,7 @@ export async function captureRuntimePage(
     const captureId = stableHash(`${requestedUrl}|${finalUrl}|${capturedAt}`);
     const screenshotPath = path.join(outputDirectory, `runtime-${captureId}.png`);
     const issues: RuntimeCaptureIssue[] = [];
-    let readiness: RuntimeCaptureManifest["readiness"];
-    try {
-      await page.waitForLoadState("networkidle", { timeout: readinessTimeoutMs });
-      readiness = { status: "ready", reason: "network-idle", timeoutMs: readinessTimeoutMs };
-    } catch {
-      readiness = { status: "partial", reason: "network-active", timeoutMs: readinessTimeoutMs };
-    }
+    const readiness = await waitForSemanticRuntimeReadiness(page, readinessTimeoutMs);
 
     let title = "";
     let pageMetadataStatus: "complete" | "failed" = "complete";
@@ -466,6 +471,75 @@ export async function captureRuntimePage(
     await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
   }
+}
+
+export function normalizeReadinessTimeout(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_RUNTIME_READINESS_TIMEOUT_MS;
+  if (!Number.isInteger(timeout) || timeout <= 0 || timeout > MAX_RUNTIME_READINESS_TIMEOUT_MS) {
+    throw new RangeError(`readinessTimeoutMs must be an integer from 1 to ${MAX_RUNTIME_READINESS_TIMEOUT_MS}`);
+  }
+  return timeout;
+}
+
+export async function waitForSemanticRuntimeReadiness(
+  page: Page,
+  timeoutMs: number,
+): Promise<RuntimeCaptureManifest["readiness"]> {
+  const boundedTimeout = normalizeReadinessTimeout(timeoutMs);
+  const started = Date.now();
+  let previousSignature = "";
+  let stablePolls = 0;
+  let observation: RuntimeReadinessObservation = {
+    visibleTextLength: 0, interactiveControlCount: 0, navigationControlCount: 0, stablePolls: 0,
+  };
+  while (Date.now() - started < boundedTimeout) {
+    const sample = await readSemanticReadiness(page);
+    const signature = `${sample.visibleTextLength}|${sample.interactiveControlCount}|${sample.navigationControlCount}`;
+    stablePolls = signature === previousSignature ? stablePolls + 1 : 1;
+    previousSignature = signature;
+    observation = { ...sample, stablePolls };
+    const meaningfulText = sample.visibleTextLength >= 20;
+    const interactive = sample.interactiveControlCount > 0;
+    const stableShell = sample.navigationControlCount > 0 || stablePolls >= 2;
+    if (meaningfulText && interactive && stableShell) {
+      return { status: "ready", reason: "semantic-ui", timeoutMs: boundedTimeout,
+        elapsedMs: Date.now() - started, observation };
+    }
+    await page.waitForTimeout(Math.min(200, Math.max(1, boundedTimeout - (Date.now() - started))));
+  }
+  return { status: "partial", reason: "semantic-timeout", timeoutMs: boundedTimeout,
+    elapsedMs: Date.now() - started, observation };
+}
+
+async function readSemanticReadiness(page: Page): Promise<Omit<RuntimeReadinessObservation, "stablePolls">> {
+  return page.evaluate(() => {
+    const controlSelector = "a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=menuitem],[role=tab]";
+    const navigationSelector = "nav a[href],nav button,[role=navigation] a[href],[role=navigation] button,[role=menuitem],[role=tab]";
+    const text = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim();
+    let interactiveControlCount = 0;
+    for (const element of document.querySelectorAll(controlSelector)) {
+      const html = element as HTMLElement;
+      const style = getComputedStyle(html);
+      const rect = html.getBoundingClientRect();
+      if (style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
+        rect.width > 0 && rect.height > 0 && !(element as HTMLButtonElement).disabled &&
+        element.getAttribute("aria-disabled") !== "true") interactiveControlCount += 1;
+    }
+    let navigationControlCount = 0;
+    for (const element of document.querySelectorAll(navigationSelector)) {
+      const html = element as HTMLElement;
+      const style = getComputedStyle(html);
+      const rect = html.getBoundingClientRect();
+      if (style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
+        rect.width > 0 && rect.height > 0 && !(element as HTMLButtonElement).disabled &&
+        element.getAttribute("aria-disabled") !== "true") navigationControlCount += 1;
+    }
+    return {
+      visibleTextLength: text.length,
+      interactiveControlCount,
+      navigationControlCount,
+    };
+  });
 }
 
 function stageIssue(

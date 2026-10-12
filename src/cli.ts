@@ -29,7 +29,7 @@ if (!command) {
   const captureOptions = readCaptureFlags(process.argv.slice(4));
   if (!url || !captureOptions) {
     console.error(
-      "Usage: source-inventory capture <http(s)-url> [--output <directory>] [--storage-state <path>]",
+      "Usage: source-inventory capture <http(s)-url> [--output <directory>] [--storage-state <path>] [--readiness-timeout-ms <n>]",
     );
     process.exitCode = 1;
   } else {
@@ -135,7 +135,7 @@ if (!command) {
     console.error(
       "Usage: source-inventory discover <http(s)-url> [--storage-state <path>] " +
       "[--output <directory>] [--max-depth <n>] [--max-states <n>] " +
-      "[--max-transitions <n>] [--max-targets-per-state <n>]",
+      "[--max-transitions <n>] [--max-targets-per-state <n>] [--readiness-timeout-ms <n>]",
     );
     process.exitCode = 1;
   } else {
@@ -153,14 +153,15 @@ if (!command) {
   if (!url || !probeOptions?.targetId) {
     console.error(
       "Usage: source-inventory probe <http(s)-url> --target <runtime-target-id> " +
-      "[--output <directory>] [--storage-state <path>]",
+      "[--output <directory>] [--storage-state <path>] [--readiness-timeout-ms <n>]",
     );
     process.exitCode = 1;
   } else {
     try {
       const result = await probeRuntimeNavigation({ url, targetId: probeOptions.targetId!,
         ...(probeOptions.outputDirectory ? { outputDirectory: probeOptions.outputDirectory } : {}),
-        ...(probeOptions.storageStatePath ? { storageStatePath: probeOptions.storageStatePath } : {}) });
+        ...(probeOptions.storageStatePath ? { storageStatePath: probeOptions.storageStatePath } : {}),
+        ...(probeOptions.readinessTimeoutMs !== undefined ? { readinessTimeoutMs: probeOptions.readinessTimeoutMs } : {}) });
       console.log(JSON.stringify(result, null, 2));
     } catch (error) {
       console.error(JSON.stringify(
@@ -294,11 +295,13 @@ function readKnowledgeEvidenceFlags(arguments_: string[]): {
 function readDiscoveryFlags(arguments_: string[]): {
   storageStatePath?: string;
   outputDirectory?: string;
+  readinessTimeoutMs?: number;
   limits?: { maxDepth?: number; maxStates?: number; maxTransitions?: number; maxTargetsPerState?: number };
 } | undefined {
   const result: {
     storageStatePath?: string;
     outputDirectory?: string;
+    readinessTimeoutMs?: number;
     limits?: { maxDepth?: number; maxStates?: number; maxTransitions?: number; maxTargetsPerState?: number };
   } = {};
   const limits: NonNullable<typeof result.limits> = {};
@@ -308,6 +311,10 @@ function readDiscoveryFlags(arguments_: string[]): {
     if (!value) return undefined;
     if (flag === "--storage-state") result.storageStatePath = value;
     else if (flag === "--output") result.outputDirectory = value;
+    else if (flag === "--readiness-timeout-ms") {
+      const number = Number(value); if (!Number.isInteger(number) || number <= 0 || number > 30_000) return undefined;
+      result.readinessTimeoutMs = number;
+    }
     else {
       const number = Number(value);
       if (!Number.isInteger(number) || number < 0) return undefined;
@@ -326,8 +333,9 @@ function readProbeFlags(arguments_: string[]): {
   targetId?: string;
   outputDirectory?: string;
   storageStatePath?: string;
+  readinessTimeoutMs?: number;
 } | undefined {
-  const result: { targetId?: string; outputDirectory?: string; storageStatePath?: string } = {};
+  const result: { targetId?: string; outputDirectory?: string; storageStatePath?: string; readinessTimeoutMs?: number } = {};
   for (let index = 0; index < arguments_.length; index += 2) {
     const flag = arguments_[index];
     const value = arguments_[index + 1];
@@ -335,6 +343,10 @@ function readProbeFlags(arguments_: string[]): {
     if (flag === "--target") result.targetId = value;
     else if (flag === "--output") result.outputDirectory = value;
     else if (flag === "--storage-state") result.storageStatePath = value;
+    else if (flag === "--readiness-timeout-ms") {
+      const number = Number(value); if (!Number.isInteger(number) || number <= 0 || number > 30_000) return undefined;
+      result.readinessTimeoutMs = number;
+    }
     else return undefined;
   }
   return result;
@@ -355,14 +367,18 @@ interface AuthenticationCliConfig {
 
 function readCaptureFlags(
   arguments_: string[],
-): { outputDirectory?: string; storageStatePath?: string } | undefined {
-  const result: { outputDirectory?: string; storageStatePath?: string } = {};
+): { outputDirectory?: string; storageStatePath?: string; readinessTimeoutMs?: number } | undefined {
+  const result: { outputDirectory?: string; storageStatePath?: string; readinessTimeoutMs?: number } = {};
   for (let index = 0; index < arguments_.length; index += 2) {
     const flag = arguments_[index];
     const value = arguments_[index + 1];
     if (!value) return undefined;
     if (flag === "--output") result.outputDirectory = value;
     else if (flag === "--storage-state") result.storageStatePath = value;
+    else if (flag === "--readiness-timeout-ms") {
+      const number = Number(value); if (!Number.isInteger(number) || number <= 0 || number > 30_000) return undefined;
+      result.readinessTimeoutMs = number;
+    }
     else return undefined;
   }
   return result;

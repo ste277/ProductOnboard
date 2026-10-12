@@ -13,6 +13,7 @@ import {
   captureInteractionCandidates,
   captureInteractiveElements,
   captureVisibleText,
+  normalizeReadinessTimeout,
   DEFAULT_RUNTIME_VIEWPORT,
   normalizeNetwork,
   normalizeText,
@@ -20,6 +21,7 @@ import {
   sanitizeRuntimeUrl,
   sanitizeAriaSnapshot,
   stableHash,
+  waitForSemanticRuntimeReadiness,
   validateRuntimeUrl,
   withTimeout,
   type RuntimeBrowserError,
@@ -132,7 +134,7 @@ export async function probeRuntimeNavigation(
   const requestedUrl = sanitizeRuntimeUrl(navigationUrl);
   const outputDirectory = path.resolve(options.outputDirectory ?? "artifacts/runtime-probes");
   const timeoutMs = options.timeoutMs ?? 30_000;
-  const readinessTimeoutMs = options.readinessTimeoutMs ?? 2_000;
+  const readinessTimeoutMs = normalizeReadinessTimeout(options.readinessTimeoutMs);
   const candidateTimeoutMs = options.candidateTimeoutMs ?? 3_000;
   const settleTimeoutMs = options.settleTimeoutMs ?? 1_000;
   let browser: Browser | undefined;
@@ -365,13 +367,7 @@ async function captureSnapshot(
   candidateTimeoutMs: number,
 ): Promise<RuntimeCaptureManifest> {
   const capturedAt = new Date().toISOString();
-  let readiness: RuntimeCaptureManifest["readiness"];
-  try {
-    await page.waitForLoadState("networkidle", { timeout: readinessTimeoutMs });
-    readiness = { status: "ready", reason: "network-idle", timeoutMs: readinessTimeoutMs };
-  } catch {
-    readiness = { status: "partial", reason: "network-active", timeoutMs: readinessTimeoutMs };
-  }
+  const readiness = await waitForSemanticRuntimeReadiness(page, readinessTimeoutMs);
   const issues: RuntimeCaptureIssue[] = [];
   const finalUrl = sanitizeRuntimeUrl(page.url());
   let title = "";

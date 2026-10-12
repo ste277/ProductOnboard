@@ -334,11 +334,15 @@ export {
   FakeKnowledgeWriter,
   formatKnowledgeBaseArticle,
   generateKnowledgeBaseArticle,
+  generateKnowledgeBaseArticleFromPackage,
   KnowledgeGenerationError,
   validateGeneratedKnowledgeArticle,
   validateKnowledgeEvidencePackage,
   type BuildKnowledgeEvidencePackageInput,
   type GenerateKnowledgeBaseArticleInput,
+  type GenerateKnowledgeBaseArticleFromPackageInput,
+  type KnowledgeArticlePlan,
+  type KnowledgeArticleType,
   type KnowledgeBaseArticle,
   type KnowledgeClaim,
   type KnowledgeClaimKind,
@@ -356,7 +360,38 @@ export {
   type KnowledgeWriterInput,
   type KnowledgeWriterOutput,
   type KnowledgeWriterStatement,
+  type KnowledgeClaimSelection,
+  type KnowledgeClaimRelevance,
+  type KnowledgeClaimExclusionReason,
+  type KnowledgeIdentityCandidate,
+  type KnowledgeScreenshotIntent,
 } from "./knowledge-base-generator.js";
+
+export {
+  FakeKnowledgeModelProvider,
+  GroundedAiKnowledgeWriter,
+  GroundedKnowledgeWriterError,
+  validateGroundedWriterOutput,
+  type GroundedKnowledgeWriterOptions,
+  type GroundedKnowledgeWriterOutput,
+  type GroundedKnowledgeWriterRequest,
+  type GroundedKnowledgeWriterResponse,
+  type GroundedWriterValidationIssue,
+  type KnowledgeModelProvider,
+} from "./grounded-ai-knowledge-writer.js";
+
+export {
+  runKnowledgeWriterHarness,
+  type KnowledgeWriterHarnessResult,
+  type RunKnowledgeWriterHarnessInput,
+} from "./knowledge-writer-harness.js";
+
+export {
+  loadOpenAiEnvironmentConfig,
+  OpenAiKnowledgeModelProvider,
+  type OpenAiEnvironmentConfig,
+  type OpenAiKnowledgeModelProviderOptions,
+} from "./openai-knowledge-model-provider.js";
 
 export {
   attachKnowledgeVisuals,
