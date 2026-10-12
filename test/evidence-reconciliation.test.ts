@@ -7,6 +7,7 @@ import {
   getRuntimeOnlyEvidence,
   getStaticOnlyEvidence,
   reconcileProductEvidence,
+  RuntimeReferenceConflictError,
   validateReconciliationManifest,
   type ReconciliationManifest,
 } from "../src/evidence-reconciliation.js";
@@ -161,6 +162,73 @@ test("scopes exact UI matching to selected routes and retains ambiguity, repetit
   assert.ok(manifest.uiContextMetrics.runtimeUiWithoutStaticContext > 0);
   assert.equal(manifest.uiContextMetrics.uniqueMatches, 4);
   assert.equal(manifest.uiContextMetrics.ambiguousMatches, 2);
+});
+
+test("normalizes repeated identical semantic references at the reconciliation boundary", () => {
+  const { staticGraph, runtime } = fixture();
+  const state = runtime.nodes.find((item) => item.semanticElements.length > 0)!;
+  const repeated = structuredClone(state.semanticElements[0]!);
+  state.semanticElements.push(repeated);
+  const manifest = reconcileProductEvidence({ staticGraph, runtimeDiscovery: runtime });
+  assert.equal(manifest.runtimeReferenceNormalization.identicalReferencesRemoved, 1);
+  assert.equal(manifest.runtimeReferenceNormalization.conflictingReferences, 0);
+  assert.equal(allResults(manifest).filter((item) => item.runtime.some((ref) =>
+    ref.stateId === state.id && ref.elementId === repeated.id)).length, 1);
+});
+
+test("rejects same-state semantic IDs with conflicting observations", () => {
+  const { staticGraph, runtime } = fixture();
+  const state = runtime.nodes.find((item) => item.semanticElements.length > 0)!;
+  const conflict = structuredClone(state.semanticElements[0]!);
+  conflict.accessibleName = `${conflict.accessibleName} conflict`;
+  state.semanticElements.push(conflict);
+  assert.throws(() => reconcileProductEvidence({ staticGraph, runtimeDiscovery: runtime }),
+    (error: unknown) => error instanceof RuntimeReferenceConflictError && error.stateId === state.id &&
+      error.sourceKind === "semantic" && error.referenceId === conflict.id);
+});
+
+test("preserves the same runtime reference ID when observed in separate states", () => {
+  const input = routeFixture(["/*"], ["https://example.test/one", "https://example.test/two"]);
+  input.runtimeDiscovery.nodes[0]!.semanticElements.push(element("shared-runtime-id", "button", "button", "Open", "Open"));
+  input.runtimeDiscovery.nodes[1]!.semanticElements.push(element("shared-runtime-id", "button", "button", "Open", "Open"));
+  const manifest = reconcileProductEvidence(input);
+  const references = allResults(manifest).filter((item) => item.runtime.some((ref) => ref.elementId === "shared-runtime-id"));
+  assert.equal(references.length, 2);
+  assert.deepEqual(references.map((item) => item.runtime[0]?.stateId).sort(), ["state-0", "state-1"]);
+  assert.equal(manifest.runtimeReferenceNormalization.identicalReferencesRemoved, 0);
+});
+
+test("keeps reconciliation identities stable after duplicate normalization", () => {
+  const input = fixture();
+  const state = input.runtime.nodes.find((item) => item.semanticElements.length > 0)!;
+  state.semanticElements.push(structuredClone(state.semanticElements[0]!));
+  const first = reconcileProductEvidence({ staticGraph: input.staticGraph, runtimeDiscovery: input.runtime });
+  const second = reconcileProductEvidence({ staticGraph: input.staticGraph, runtimeDiscovery: input.runtime });
+  assert.deepEqual(second, first);
+  assert.equal(new Set(allResults(first).map((item) => item.id)).size, allResults(first).length);
+});
+
+test("retains canonical runtime provenance without mutating duplicate evidence", () => {
+  const { staticGraph, runtime } = fixture();
+  const state = runtime.nodes.find((item) => item.semanticElements.length > 0)!;
+  const canonical = state.semanticElements[0]!;
+  canonical.provenance = ["accessibility", "dom"];
+  state.semanticElements.push(structuredClone(canonical));
+  const before = JSON.stringify(runtime);
+  const manifest = reconcileProductEvidence({ staticGraph, runtimeDiscovery: runtime });
+  assert.equal(JSON.stringify(runtime), before);
+  assert.deepEqual(state.semanticElements[0]?.provenance, ["accessibility", "dom"]);
+  assert.equal(manifest.runtimeReferenceNormalization.identicalReferencesRemoved, 1);
+});
+
+test("leaves duplicate-free reconciliation behavior unchanged", () => {
+  const { staticGraph, runtime } = fixture();
+  const first = reconcileProductEvidence({ staticGraph, runtimeDiscovery: runtime });
+  const second = reconcileProductEvidence({ staticGraph, runtimeDiscovery: structuredClone(runtime) });
+  assert.deepEqual(second, first);
+  assert.equal(first.runtimeReferenceNormalization.identicalReferencesRemoved, 0);
+  assert.equal(first.runtimeReferenceNormalization.canonicalObservations,
+    runtime.nodes.reduce((count, state) => count + state.semanticElements.length + state.interactionCandidates.length, 0));
 });
 
 test("reconciles navigation destinations and labels while retaining same-URL transitions", () => {

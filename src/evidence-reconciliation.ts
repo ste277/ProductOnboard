@@ -114,6 +114,23 @@ export interface ReconciliationUiContextMetrics {
   ambiguousMatches: number;
 }
 
+export interface RuntimeReferenceNormalization {
+  canonicalObservations: number;
+  identicalReferencesRemoved: number;
+  conflictingReferences: number;
+}
+
+export class RuntimeReferenceConflictError extends Error {
+  constructor(
+    public readonly stateId: string,
+    public readonly sourceKind: "semantic" | "candidate",
+    public readonly referenceId: string,
+  ) {
+    super(`Conflicting runtime ${sourceKind} observations for state ${stateId} and ID ${referenceId}`);
+    this.name = "RuntimeReferenceConflictError";
+  }
+}
+
 export interface ReconciliationManifest {
   id: string;
   staticGraphId: string;
@@ -125,6 +142,7 @@ export interface ReconciliationManifest {
   coverage: ReconciliationCoverage;
   summary: Record<ReconciliationDomain, ReconciliationDomainSummary>;
   uiContextMetrics: ReconciliationUiContextMetrics;
+  runtimeReferenceNormalization: RuntimeReferenceNormalization;
   textSummary: string;
 }
 
@@ -173,9 +191,10 @@ export function reconcileProductEvidence(input: ReconcileProductEvidenceInput): 
   const staticGraphId = graphId(input.staticGraph);
   const runtimeDiscoveryId = discoveryId(input.runtimeDiscovery);
   const routeResults = reconcileRoutes(input.staticGraph, input.runtimeDiscovery);
+  const runtimeUi = runtimeUiDescriptors(input.runtimeDiscovery);
   const results = [
     ...routeResults,
-    ...reconcileUi(input.staticGraph, input.runtimeDiscovery, routeResults),
+    ...reconcileUi(input.staticGraph, input.runtimeDiscovery, routeResults, runtimeUi.descriptors),
     ...reconcileNavigation(input.staticGraph, input.runtimeDiscovery),
     ...reconcileHttp(input.staticGraph, input.runtimeDiscovery),
     ...reconcileGraphql(input.staticGraph, input.runtimeDiscovery),
@@ -191,6 +210,7 @@ export function reconcileProductEvidence(input: ReconcileProductEvidenceInput): 
     coverage: coverage(input.runtimeDiscovery),
     summary: summarize(results),
     uiContextMetrics: summarizeUiContext(results),
+    runtimeReferenceNormalization: runtimeUi.normalization,
     textSummary: "",
   };
   manifest.textSummary = formatReconciliationSummary(manifest);
@@ -250,9 +270,8 @@ function reconcileRoutes(graph: ProductEvidenceGraph, runtime: RuntimeNavigation
 }
 
 function reconcileUi(graph: ProductEvidenceGraph, runtime: RuntimeNavigationDiscoveryGraph,
-  routeResults: ReconciledEvidenceResult[]): ReconciledEvidenceResult[] {
+  routeResults: ReconciledEvidenceResult[], runtimeUi: RuntimeUiDescriptor[]): ReconciledEvidenceResult[] {
   const staticUi = staticUiDescriptors(graph);
-  const runtimeUi = runtimeUiDescriptors(runtime);
   const descriptorById = new Map(staticUi.map((item) => [item.node.id, item]));
   const routeScopes = staticUiRouteScopes(graph, routeResults);
   const selectedRouteByState = new Map(routeResults.filter((item) => item.domain === "route" && item.status === "corroborated" &&
@@ -595,16 +614,53 @@ function staticUiRouteScopes(graph: ProductEvidenceGraph,
   return scopes;
 }
 
-function runtimeUiDescriptors(runtime: RuntimeNavigationDiscoveryGraph): RuntimeUiDescriptor[] {
-  return runtime.nodes.flatMap((state) => [
-    ...state.semanticElements.map((item) => ({ state, kind: "semantic" as const, id: item.id,
-      tag: item.type.toLowerCase(), role: item.role.toLowerCase(), name: item.accessibleName,
-      visibleText: item.visibleText ?? "", placeholder: item.placeholder ?? "", inputType: item.inputType ?? "",
-      strongInteraction: false })),
-    ...state.interactionCandidates.map((item) => ({ state, kind: "candidate" as const, id: item.id,
-      tag: item.tag.toLowerCase(), role: item.role ?? "", name: item.accessibleName ?? "", visibleText: item.text,
-      placeholder: "", inputType: "", strongInteraction: item.strength === "strong" })),
-  ]);
+function runtimeUiDescriptors(runtime: RuntimeNavigationDiscoveryGraph): {
+  descriptors: RuntimeUiDescriptor[];
+  normalization: RuntimeReferenceNormalization;
+} {
+  const descriptors: RuntimeUiDescriptor[] = [];
+  const observations = new Map<string, string>();
+  let identicalReferencesRemoved = 0;
+  for (const state of runtime.nodes) {
+    for (const item of state.semanticElements) {
+      if (!retainRuntimeObservation(observations, state.id, "semantic", item.id, item)) {
+        identicalReferencesRemoved += 1; continue;
+      }
+      descriptors.push({ state, kind: "semantic", id: item.id,
+        tag: item.type.toLowerCase(), role: item.role.toLowerCase(), name: item.accessibleName,
+        visibleText: item.visibleText ?? "", placeholder: item.placeholder ?? "", inputType: item.inputType ?? "",
+        strongInteraction: false });
+    }
+    for (const item of state.interactionCandidates) {
+      if (!retainRuntimeObservation(observations, state.id, "candidate", item.id, item)) {
+        identicalReferencesRemoved += 1; continue;
+      }
+      descriptors.push({ state, kind: "candidate", id: item.id,
+        tag: item.tag.toLowerCase(), role: item.role ?? "", name: item.accessibleName ?? "", visibleText: item.text,
+        placeholder: "", inputType: "", strongInteraction: item.strength === "strong" });
+    }
+  }
+  return { descriptors, normalization: { canonicalObservations: descriptors.length,
+    identicalReferencesRemoved, conflictingReferences: 0 } };
+}
+
+function retainRuntimeObservation(observations: Map<string, string>, stateId: string,
+  kind: "semantic" | "candidate", id: string, observation: unknown): boolean {
+  const key = `${stateId}|${kind}|${id}`;
+  const value = canonicalJson(observation);
+  const previous = observations.get(key);
+  if (previous === undefined) { observations.set(key, value); return true; }
+  if (previous === value) return false;
+  throw new RuntimeReferenceConflictError(stateId, kind, id);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
 }
 
 function uiMatchReasons(item: StaticUiDescriptor, candidate: RuntimeUiDescriptor): string[] | undefined {
