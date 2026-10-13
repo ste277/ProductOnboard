@@ -116,6 +116,16 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
       body.warningId, body.placeholder, typeof body.reviewer === "string" ? body.reviewer : undefined));
   }
   const reviewMatch = /^\/api\/documents\/(document-[0-9a-f-]{36})\/review$/.exec(url.pathname);
+  const imageReviewMatch = /^\/api\/documents\/(document-[0-9a-f-]{36})\/screenshot-reviews$/.exec(url.pathname);
+  if (request.method === "POST" && imageReviewMatch) {
+    const body = await readJsonBody(request);
+    if (!record(body) || typeof body.expectedRevisionId !== "string" || typeof body.stateId !== "string" ||
+      (body.disposition !== "accepted-safe" && body.disposition !== "excluded")) {
+      return json(response, 400, { message: "Screenshot and explicit disposition are required" });
+    }
+    return json(response, 201, await workspace.reviewScreenshot(imageReviewMatch[1]!, body.expectedRevisionId,
+      body.stateId, body.disposition, typeof body.reviewer === "string" ? body.reviewer : undefined));
+  }
   if (request.method === "POST" && reviewMatch) {
     const body = await readJsonBody(request);
     if (!record(body) || typeof body.expectedRevisionId !== "string" ||

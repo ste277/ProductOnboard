@@ -18,7 +18,19 @@ export type DocsWorkspaceObjective = "feature-overview" | "how-to-guide";
 export type DocumentGenerationStatus = "generating" | "succeeded" | "failed";
 export type DocumentReviewStatus = "draft" | "needs-review" | "approved";
 export type RevisionValidationStatus = "needs-validation" | "passed" | "failed";
-export type ReviewAction = "generated" | "saved" | "validated" | "changes-requested" | "approved" | "tenant-redacted";
+export type ReviewAction = "generated" | "saved" | "validated" | "changes-requested" | "approved" | "tenant-redacted" | "screenshot-reviewed";
+
+export interface ScreenshotReview {
+  stateId: string;
+  path: string;
+  checksum: string;
+  safety: "known-tenant-information" | "unknown";
+  tenantSignals: TenantSignal[];
+  evidenceRefs: string[];
+  disposition: "needs-review" | "accepted-safe" | "excluded";
+  reviewer?: string;
+  reviewedAt?: string;
+}
 
 export interface DocsWorkspaceFeature {
   id: string;
@@ -79,6 +91,7 @@ export interface DocumentRevision {
   };
   evidenceAssociations: RevisionEvidenceAssociation[];
   tenantWarnings: TenantDataWarning[];
+  screenshotReviews?: ScreenshotReview[];
 }
 
 export interface DocumentAuditEntry {
@@ -112,6 +125,8 @@ export interface DocsWorkspaceDocument {
   currentRevisionId?: string;
   revisions?: DocumentRevision[];
   auditTrail?: DocumentAuditEntry[];
+  approvedContent?: { revisionId: string; title: string; markdown: string; evidencePackageChecksum: string;
+    screenshots: Array<{ stateId: string; path: string; checksum: string }> };
   failure?: { classification: "generation-failed"; message: string };
 }
 
@@ -207,6 +222,7 @@ export class DocsWorkspace {
       document.articleMarkdown = formatKnowledgeBaseArticle(result.article, false);
       if (result.screenshotMapping) document.screenshotMapping = result.screenshotMapping;
       const revision = initialRevision(document.articleMarkdown, document.title, timestamp, "AI generation", result.article);
+      revision.screenshotReviews = await screenshotReviews(selected.evidencePackage);
       document.currentRevisionId = revision.id;
       document.revisions = [revision];
       document.auditTrail = [auditEntry(document, revision, "generated", timestamp, "AI generation")];
@@ -248,10 +264,14 @@ export class DocsWorkspace {
       checksum: checksumText(`${title}\n${markdown}`),
       validation: { status: "needs-validation", supportedStatements: 0, unsupportedStatements: 0, issues: [] },
       evidenceAssociations: [], tenantWarnings: detectTenantWarnings(markdown),
+      screenshotReviews: structuredClone(previous.screenshotReviews ?? []).map((item) =>
+        item.disposition === "excluded" && markdown.includes(item.path)
+          ? { ...item, disposition: "needs-review" } : item),
     };
     document.title = title;
     document.articleMarkdown = markdown;
     document.reviewStatus = "draft";
+    delete document.approvedContent;
     document.updatedAt = timestamp;
     document.currentRevisionId = revision.id;
     document.revisions = [...(document.revisions ?? []), revision];
@@ -324,13 +344,65 @@ export class DocsWorkspace {
       if (!revision.evidenceAssociations.length || revision.evidenceAssociations.some((item) => item.status !== "valid")) {
         throw new Error("Approval requires valid evidence references");
       }
+      await this.readFrozenEvidence(document);
+      if ((revision.screenshotReviews ?? []).some((item) => item.disposition !== "excluded" &&
+        (item.disposition !== "accepted-safe" || item.safety === "known-tenant-information" || item.checksum === "unavailable"))) {
+        throw new Error("Approval requires screenshot review; known tenant information must be excluded");
+      }
       document.reviewStatus = "approved";
+      document.approvedContent = { revisionId: revision.id, title: revision.title, markdown: revision.markdown,
+        evidencePackageChecksum: document.evidencePackageChecksum,
+        screenshots: (revision.screenshotReviews ?? []).filter((item) => item.disposition === "accepted-safe")
+          .map(({ stateId, path: imagePath, checksum }) => ({ stateId, path: imagePath, checksum })) };
       document.auditTrail = [...(document.auditTrail ?? []), auditEntry(document, revision, "approved", timestamp, actor)];
     } else {
       document.reviewStatus = "draft";
+      delete document.approvedContent;
       document.auditTrail = [...(document.auditTrail ?? []), auditEntry(document, revision, "changes-requested", timestamp, actor)];
     }
     document.updatedAt = timestamp;
+    await this.persistDocument(document);
+    return structuredClone(document);
+  }
+
+  async reviewScreenshot(documentId: string, expectedRevisionId: string, stateId: string,
+    disposition: "accepted-safe" | "excluded", reviewer?: string): Promise<DocsWorkspaceDocument> {
+    const document = await this.requireDocument(documentId);
+    assertCurrentRevision(document, expectedRevisionId);
+    const previous = currentRevision(document);
+    const image = previous.screenshotReviews?.find((item) => item.stateId === stateId);
+    if (!image) throw new Error("Screenshot is not part of the frozen evidence");
+    if (disposition === "accepted-safe" && (image.safety === "known-tenant-information" || image.checksum === "unavailable")) {
+      throw new Error("Known tenant information or unavailable screenshots cannot be accepted as safe; exclude the screenshot");
+    }
+    const timestamp = this.now().toISOString();
+    const actor = safeReviewer(reviewer);
+    const revision = structuredClone(previous);
+    revision.id = `revision-${randomUUID()}`;
+    revision.number += 1;
+    revision.createdAt = timestamp;
+    revision.reviewer = actor;
+    revision.screenshotReviews = (revision.screenshotReviews ?? []).map((item) => item.stateId === stateId
+      ? { ...item, disposition, reviewer: actor, reviewedAt: timestamp } : item);
+    if (disposition === "excluded") {
+      revision.markdown = normalizeMarkdown(revision.markdown.split("\n").filter((line) =>
+        ![image.path, `- ${image.path}`].includes(line.trim())).join("\n"));
+      const result = revalidateMarkdown(revision.markdown, document.article, await this.readFrozenEvidence(document));
+      revision.validation = { status: result.issues.length ? "failed" : "passed", validatedAt: timestamp,
+        supportedStatements: result.supportedStatements, unsupportedStatements: result.issues.length, issues: result.issues };
+      revision.evidenceAssociations = result.associations;
+      revision.tenantWarnings = mergeTenantWarnings(revision.tenantWarnings, detectTenantWarnings(revision.markdown));
+    }
+    revision.checksum = checksumText(JSON.stringify({ title: revision.title, markdown: revision.markdown,
+      screenshots: revision.screenshotReviews }));
+    document.currentRevisionId = revision.id;
+    document.revisions = [...(document.revisions ?? []), revision];
+    document.articleMarkdown = revision.markdown;
+    document.reviewStatus = "needs-review";
+    document.updatedAt = timestamp;
+    delete document.approvedContent;
+    document.auditTrail = [...(document.auditTrail ?? []), auditEntry(document, revision, "screenshot-reviewed", timestamp, actor)];
+    await this.persistRevision(document.id, revision);
     await this.persistDocument(document);
     return structuredClone(document);
   }
@@ -409,6 +481,19 @@ export class DocsWorkspace {
   private async readDocument(id: string): Promise<DocsWorkspaceDocument> {
     const document = JSON.parse(await readFile(path.join(this.documentDirectory(id), "document.json"), "utf8")) as DocsWorkspaceDocument;
     hydrateLegacyRevision(document);
+    if (document.revisions?.length) {
+      const images = await screenshotReviews(await this.readFrozenEvidence(document));
+      const revision = currentRevision(document);
+      revision.screenshotReviews = images.map((item) => {
+        const previous = revision.screenshotReviews?.find((entry) => entry.stateId === item.stateId);
+        return previous?.checksum === item.checksum && previous.safety === item.safety ? previous : item;
+      });
+      if (document.reviewStatus === "approved" && currentRevision(document).screenshotReviews?.some((item) =>
+        item.disposition === "needs-review" || (item.disposition === "accepted-safe" && item.safety === "known-tenant-information"))) {
+        document.reviewStatus = "needs-review";
+        delete document.approvedContent;
+      }
+    }
     validateDocument(document); return document;
   }
 
@@ -526,6 +611,15 @@ function revalidateMarkdown(markdown: string, article: KnowledgeBaseArticle | un
     if (block.kind === "heading") continue;
     const match = ledger.find((item) => equivalentSupportedText(block.text, item.text));
     if (!match) {
+      const eligibleClaim = package_.claims.find((item) => item.publishable && item.customerVisible &&
+        item.status !== "ambiguous" && item.status !== "conflicting" && equivalentSupportedText(block.text, item.text));
+      if (eligibleClaim) {
+        supportedStatements += 1;
+        associations.push({ blockIndex: block.index, text: block.text, claimIds: [eligibleClaim.id],
+          evidenceRefs: [...eligibleClaim.support.runtimeStateIds, ...eligibleClaim.support.staticNodeIds,
+            ...eligibleClaim.support.reconciliationIds], status: "valid" });
+        continue;
+      }
       const limitation = package_.limitations.find((item) => equivalentSupportedText(block.text, item.message));
       const screenshot = package_.screenshots.find((item) => block.text === item.path);
       if (limitation || screenshot) {
@@ -621,6 +715,20 @@ function hydrateLegacyRevision(document: DocsWorkspaceDocument): void {
   document.auditTrail = [{ id: `audit-legacy-${revision.checksum.slice(0, 24)}`, revisionId: revision.id,
     action: "generated", timestamp: document.updatedAt, reviewer: "AI generation",
     validationStatus: revision.validation.status, evidencePackageChecksum: document.evidencePackageChecksum }];
+}
+
+async function screenshotReviews(package_: KnowledgeEvidencePackage): Promise<ScreenshotReview[]> {
+  return Promise.all(package_.screenshots.map(async (image) => {
+    const related = package_.claims.filter((item) => item.customerVisible &&
+      item.support.runtimeStateIds.includes(image.runtimeStateId));
+    const signals = detectTenantSignals({ ...package_, claims: related });
+    let checksum = "unavailable";
+    try { checksum = createHash("sha256").update(await readFile(image.path)).digest("hex"); } catch { /* Review requires a readable image. */ }
+    return { stateId: image.runtimeStateId, path: image.path, checksum,
+      safety: signals.length ? "known-tenant-information" : "unknown", tenantSignals: signals,
+      evidenceRefs: [...image.evidenceRefs, ...related.filter((item) => sensitiveValues(item.text).length)
+        .map((item) => item.id)], disposition: "needs-review" };
+  }));
 }
 
 function checksumText(source: string): string { return createHash("sha256").update(source).digest("hex"); }

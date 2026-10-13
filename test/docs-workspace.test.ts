@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Script } from "node:vm";
+import { chromium } from "playwright";
 import { afterEach, test } from "node:test";
 import { DocsWorkspace, validateDocument, type DocsWorkspaceDocument } from "../src/docs-workspace.js";
 import { startDocsWorkspaceServer } from "../src/docs-workspace-server.js";
@@ -12,6 +14,19 @@ import type { RuntimeNavigationDiscoveryGraph } from "../src/runtime-discovery.j
 
 const directories: string[] = [];
 afterEach(async () => Promise.all(directories.splice(0).map((item) => rm(item, { recursive: true, force: true }))));
+
+test("serves syntactically valid browser JavaScript with escaped newline block controls", async () => {
+  const fixture = await workspaceFixture();
+  const running = await startDocsWorkspaceServer({ workspace: fixture.workspace });
+  try {
+    const response = await fetch(new URL("/workspace.js", running.url));
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /javascript/);
+    const javascript = await response.text();
+    assert.doesNotThrow(() => new Script(javascript, { filename: "/workspace.js" }));
+    assert.ok(javascript.includes("insertText(markdown,'\\n\\n')"));
+  } finally { await running.close(); }
+});
 
 test("lists analyzed features, readiness, objectives, and an empty document state", async () => {
   const fixture = await workspaceFixture();
@@ -94,13 +109,100 @@ test("redacts tenant information, revalidates evidence, approves explicitly, and
   assert.equal(validated.revisions?.at(-1)?.validation.status, "passed");
   await assert.rejects(fixture.workspace.reviewDocument(validated.id, validated.currentRevisionId!, "approve", false),
     /confirmation/);
-  const approved = await fixture.workspace.reviewDocument(validated.id, validated.currentRevisionId!, "approve", true,
+  await assert.rejects(fixture.workspace.reviewDocument(validated.id, validated.currentRevisionId!, "approve", true),
+    /screenshot review/);
+  const excluded = await fixture.workspace.reviewScreenshot(validated.id, validated.currentRevisionId!, "state-mail", "excluded");
+  const approved = await fixture.workspace.reviewDocument(excluded.id, excluded.currentRevisionId!, "approve", true,
     "Local reviewer");
   assert.equal(approved.reviewStatus, "approved");
   assert.equal(approved.auditTrail?.at(-1)?.action, "approved");
   assert.equal(approved.auditTrail?.at(-1)?.evidencePackageChecksum, approved.evidencePackageChecksum);
   const requested = await fixture.workspace.reviewDocument(approved.id, approved.currentRevisionId!, "request-changes", false);
   assert.equal(requested.reviewStatus, "draft");
+});
+
+test("known tenant screenshots require exclusion and preserve image bytes and previous revisions", async () => {
+  const fixture = await workspaceFixture();
+  const generated = await fixture.workspace.generateDocument({ featureId: "feature-mail", objective: "feature-overview" });
+  const before = await readFile(fixture.screenshot);
+  assert.equal(generated.revisions?.[0]?.screenshotReviews?.[0]?.safety, "known-tenant-information");
+  await assert.rejects(fixture.workspace.reviewScreenshot(generated.id, generated.currentRevisionId!, "state-mail", "accepted-safe"),
+    /cannot be accepted as safe/);
+  const excluded = await fixture.workspace.reviewScreenshot(generated.id, generated.currentRevisionId!, "state-mail", "excluded");
+  assert.equal(excluded.revisions?.at(-1)?.screenshotReviews?.[0]?.disposition, "excluded");
+  assert.equal(excluded.revisions?.[0]?.screenshotReviews?.[0]?.disposition, "needs-review");
+  assert.equal(excluded.articleMarkdown?.includes(fixture.screenshot), false);
+  assert.deepEqual(await readFile(fixture.screenshot), before);
+  const redacted = await fixture.workspace.redactTenantWarning(excluded.id, excluded.currentRevisionId!,
+    excluded.revisions!.at(-1)!.tenantWarnings[0]!.id, "[your support email address]");
+  const validated = await fixture.workspace.validateRevision(redacted.id, redacted.currentRevisionId!);
+  const approved = await fixture.workspace.reviewDocument(validated.id, validated.currentRevisionId!, "approve", true);
+  assert.deepEqual(approved.approvedContent?.screenshots, []);
+});
+
+test("screenshots without tenant signals remain unknown and require explicit review; changes invalidate the disposition", async () => {
+  // Use a separate fixture with no tenant values; absence of matches must not imply image safety.
+  const cleanFixture = await workspaceFixture({ tenantText: "A support mailbox is visible." });
+  const clean = await cleanFixture.workspace.generateDocument({ featureId: "feature-mail", objective: "feature-overview" });
+  assert.equal(clean.revisions?.[0]?.screenshotReviews?.[0]?.safety, "unknown");
+  await assert.rejects(cleanFixture.workspace.reviewDocument(clean.id, clean.currentRevisionId!, "approve", true), /screenshot review/);
+  const accepted = await cleanFixture.workspace.reviewScreenshot(clean.id, clean.currentRevisionId!, "state-mail", "accepted-safe");
+  const approved = await cleanFixture.workspace.reviewDocument(accepted.id, accepted.currentRevisionId!, "approve", true);
+  assert.equal(approved.approvedContent?.screenshots.length, 1);
+  await writeFile(cleanFixture.screenshot, Buffer.from("changed-image"));
+  const changed = await cleanFixture.workspace.getDocument(clean.id);
+  assert.equal(changed?.reviewStatus, "needs-review");
+  assert.equal(changed?.revisions?.at(-1)?.screenshotReviews?.[0]?.disposition, "needs-review");
+});
+
+test("reviewer can cite an eligible frozen tenant claim absent from the original article, redact it, and revalidate", async () => {
+  const fixture = await workspaceFixture({ writerTenantText: "A support mailbox is visible." });
+  const generated = await fixture.workspace.generateDocument({ featureId: "feature-mail", objective: "feature-overview" });
+  const edited = await fixture.workspace.saveRevision(generated.id, { expectedRevisionId: generated.currentRevisionId!,
+    title: generated.title, markdown: `${generated.articleMarkdown}\n\n- support@tenant.superops.ai is visible.\n` });
+  const validated = await fixture.workspace.validateRevision(edited.id, edited.currentRevisionId!);
+  assert.equal(validated.revisions?.at(-1)?.validation.status, "passed");
+  assert.equal(validated.revisions?.at(-1)?.tenantWarnings.length, 1);
+  const redacted = await fixture.workspace.redactTenantWarning(validated.id, validated.currentRevisionId!,
+    validated.revisions!.at(-1)!.tenantWarnings[0]!.id, "[your support email address]");
+  const revalidated = await fixture.workspace.validateRevision(redacted.id, redacted.currentRevisionId!);
+  assert.equal(revalidated.revisions?.at(-1)?.validation.status, "passed");
+});
+
+test("browser editor exposes save states, preserves failed edits, and fits a 390 x 844 viewport", async () => {
+  const fixture = await workspaceFixture();
+  const generated = await fixture.workspace.generateDocument({ featureId: "feature-mail", objective: "feature-overview" });
+  const running = await startDocsWorkspaceServer({ workspace: fixture.workspace });
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    await page.goto(new URL(`/docs/${generated.id}`, running.url).href);
+    await page.locator("#save-status").waitFor();
+    assert.equal(await page.locator("#save-status").innerText(), "Saved");
+    await page.locator("#markdown").fill(`${generated.articleMarkdown}\n## ${"LongHeading".repeat(60)}\n`);
+    assert.equal(await page.locator("#save-status").innerText(), "Unsaved changes");
+    const measure = () => page.evaluate(() => ({ width: window.innerWidth, scrollWidth: document.documentElement.scrollWidth }));
+    assert.deepEqual(await measure(), { width: 390, scrollWidth: 390 });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    await page.route("**/revisions", async (route) => { await gate; await route.continue(); });
+    await page.getByRole("button", { name: "Save draft", exact: true }).click();
+    assert.equal(await page.locator("#save-status").innerText(), "Saving");
+    release();
+    await page.waitForFunction(() => document.querySelector("#save-status")?.textContent === "Saved");
+    await page.unroute("**/revisions");
+    await page.getByLabel("Title", { exact: true }).fill("");
+    await page.getByRole("button", { name: "Save draft", exact: true }).click();
+    await page.waitForFunction(() => document.querySelector("#save-status")?.textContent === "Save failed");
+    assert.match(await page.locator("#save-error").innerText(), /Title and Markdown/);
+    assert.equal(await page.getByLabel("Title", { exact: true }).inputValue(), "");
+    assert.equal(await page.getByRole("button", { name: "Approve", exact: true }).isEnabled(), false);
+    assert.deepEqual(await measure(), { width: 390, scrollWidth: 390 });
+    for (const name of ["Save draft", "Request changes", "Revalidate", "Approve"]) {
+      const box = await page.getByRole("button", { name, exact: true }).boundingBox();
+      assert.ok(box && box.x >= 0 && box.x + box.width <= 390);
+    }
+  } finally { await browser.close(); await running.close(); }
 });
 
 test("rejects stale revision updates deterministically", async () => {
@@ -150,12 +252,13 @@ test("serves workspace routes, protects APIs, persists generation, and allowlist
   } finally { await running.close(); }
 });
 
-async function workspaceFixture(options: { procedureReady?: boolean; failWriter?: boolean } = {}) {
+async function workspaceFixture(options: { procedureReady?: boolean; failWriter?: boolean; tenantText?: string; writerTenantText?: string } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "docs-workspace-")); directories.push(root);
   const evidence = path.join(root, "acceptance", "run", "evidence"); const data = path.join(root, "data");
   await mkdir(evidence, { recursive: true });
   const screenshot = path.join(root, "mail.png"); await writeFile(screenshot, Buffer.from("png-fixture"));
   const package_ = evidencePackage(screenshot, options.procedureReady !== false);
+  if (options.tenantText) package_.claims.find((item) => item.id === "tenant")!.text = options.tenantText;
   await writeFile(path.join(evidence, "evidence-package.json"), `${JSON.stringify(package_, null, 2)}\n`);
   await writeFile(path.join(evidence, "runtime-discovery.json"), `${JSON.stringify(runtime(screenshot), null, 2)}\n`);
   await writeFile(path.join(root, "acceptance", "run", "baseline.json"),
@@ -165,7 +268,7 @@ async function workspaceFixture(options: { procedureReady?: boolean; failWriter?
       new GroundedAiKnowledgeWriter({ objective, ...(articleMode ? { articleMode } : {}),
         provider: new FakeKnowledgeModelProvider("test", "test-model", options.failWriter
           ? [{ secret: "provider-secret" }, { secret: "provider-secret" }]
-          : [{ output: writerOutput(options.procedureReady !== false) }]) }) });
+          : [{ output: writerOutput(options.procedureReady !== false, options.writerTenantText ?? options.tenantText) }]) }) });
   return { root, data, screenshot, workspace };
 }
 
@@ -191,13 +294,13 @@ function evidencePackage(screenshot: string, procedureReady: boolean): Knowledge
     provenance: ["state-mail"], policy: { allowRuntimeOnly: true, allowStaticOnly: false } };
 }
 
-function writerOutput(procedureReady: boolean): GroundedKnowledgeWriterOutput {
+function writerOutput(procedureReady: boolean, tenantText?: string): GroundedKnowledgeWriterOutput {
   const selected = ["name", "action", "tenant", ...(procedureReady ? ["outcome"] : [])];
   return { title: "Domain and Email", titleClaimIds: ["name"], articleType: procedureReady ? "procedure" : "overview",
     summary: { text: "Review Domain and Email mailbox options.", claimIds: ["name"] }, prerequisites: [],
     steps: [{ text: "Select Add new mailbox.", claimIds: ["action"] }],
     ...(procedureReady ? { expectedResult: { text: "Mailbox options are visible.", claimIds: ["outcome"] } } : {}),
-    notes: [{ text: "support@tenant.superops.ai is visible.", claimIds: ["tenant"] }],
+    notes: [{ text: tenantText ?? "support@tenant.superops.ai is visible.", claimIds: ["tenant"] }],
     limitations: [{ text: "Runtime evidence is bounded.", claimIds: ["name"] }],
     claimSelection: { selectedClaims: selected.map((claimId) => ({ claimId, relevance: "task-relevant" as const,
       reason: "Supports this document" })), contextClaims: [], excludedClaims: [], duplicatesRemoved: [] },

@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "graphql": "^16.11.0",
+    "markdown-it": "^15.0.2",
     "playwright": "^1.63.0",
     "typescript": "^5.9.2"
   },
