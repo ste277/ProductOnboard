@@ -16,7 +16,8 @@
     "build": "tsc -p tsconfig.build.json",
     "lint": "eslint .",
     "test": "tsx --test test/**/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "workspace": "tsx src/cli.ts workspace"
   },
   "engines": {
     "node": ">=20"

@@ -3,4 +3,5 @@ dist/
 coverage/
 artifacts/runtime/sessions/
 .env.local
+.docs-workspace/
 acceptance/

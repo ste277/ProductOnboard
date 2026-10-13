@@ -18,12 +18,39 @@ import { reconcileProductContract } from "./contract-reconciliation.js";
 import { buildKnowledgeEvidencePackage } from "./knowledge-base-generator.js";
 import type { ProductEvidenceGraph } from "./product-evidence-graph.js";
 import type { RuntimeNavigationDiscoveryGraph } from "./runtime-discovery.js";
+import { DocsWorkspace } from "./docs-workspace.js";
+import { startDocsWorkspaceServer } from "./docs-workspace-server.js";
+import { GroundedAiKnowledgeWriter } from "./grounded-ai-knowledge-writer.js";
+import { loadOpenAiEnvironmentConfig, OpenAiKnowledgeModelProvider } from "./openai-knowledge-model-provider.js";
 
 const command = process.argv[2];
 
 if (!command) {
   console.error("Usage: source-inventory <repository-path>");
   process.exitCode = 1;
+} else if (command === "workspace") {
+  const workspaceOptions = readWorkspaceFlags(process.argv.slice(3));
+  if (!workspaceOptions) {
+    console.error("Usage: source-inventory workspace [--evidence-root <directory>] [--data <directory>] [--port <n>]");
+    process.exitCode = 1;
+  } else {
+    try {
+      const config = await loadOpenAiEnvironmentConfig(".env.local");
+      const workspace = new DocsWorkspace({ evidenceRoot: workspaceOptions.evidenceRoot,
+        dataDirectory: workspaceOptions.dataDirectory,
+        writerFactory: (options) => new GroundedAiKnowledgeWriter({ ...options,
+          provider: new OpenAiKnowledgeModelProvider(config) }) });
+      const running = await startDocsWorkspaceServer({ workspace,
+        ...(workspaceOptions.port !== undefined ? { port: workspaceOptions.port } : {}) });
+      console.log(`Docs Workspace: ${running.url}`);
+      const stop = async () => { await running.close(); process.exit(0); };
+      process.once("SIGINT", () => { void stop(); });
+      process.once("SIGTERM", () => { void stop(); });
+    } catch (error) {
+      console.error(JSON.stringify({ message: error instanceof Error ? error.message : String(error) }));
+      process.exitCode = 1;
+    }
+  }
 } else if (command === "capture") {
   const url = process.argv[3];
   const captureOptions = readCaptureFlags(process.argv.slice(4));
@@ -380,6 +407,24 @@ function readCaptureFlags(
       result.readinessTimeoutMs = number;
     }
     else return undefined;
+  }
+  return result;
+}
+
+function readWorkspaceFlags(arguments_: string[]): { evidenceRoot: string; dataDirectory: string; port?: number } | undefined {
+  const result: { evidenceRoot: string; dataDirectory: string; port?: number } = {
+    evidenceRoot: "acceptance",
+    dataDirectory: ".docs-workspace",
+  };
+  if (arguments_.length % 2 !== 0) return undefined;
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const flag = arguments_[index]; const value = arguments_[index + 1]; if (!value) return undefined;
+    if (flag === "--evidence-root") result.evidenceRoot = value;
+    else if (flag === "--data") result.dataDirectory = value;
+    else if (flag === "--port") {
+      const port = Number(value); if (!Number.isInteger(port) || port < 0 || port > 65_535) return undefined;
+      result.port = port;
+    } else return undefined;
   }
   return result;
 }

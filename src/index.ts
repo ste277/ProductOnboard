@@ -427,3 +427,23 @@ export {
   type AuthenticationSuccessCondition,
   type CreateAuthenticatedSessionOptions,
 } from "./authenticated-session.js";
+
+export {
+  DocsWorkspace,
+  detectTenantSignals,
+  validateDocument,
+  type DocsWorkspaceDocument,
+  type DocsWorkspaceFeature,
+  type DocsWorkspaceObjective,
+  type DocsWorkspaceOptions,
+  type DocumentGenerationStatus,
+  type DocumentReviewStatus,
+  type GenerateDocsWorkspaceDocumentInput,
+  type TenantSignal,
+} from "./docs-workspace.js";
+
+export {
+  startDocsWorkspaceServer,
+  type DocsWorkspaceServerOptions,
+  type RunningDocsWorkspaceServer,
+} from "./docs-workspace-server.js";
