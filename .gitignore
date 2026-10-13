@@ -3,3 +3,4 @@ dist/
 coverage/
 artifacts/runtime/sessions/
 .env.local
+acceptance/
