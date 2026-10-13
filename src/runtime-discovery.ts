@@ -40,6 +40,7 @@ export type RuntimeDiscoveryBranchStopReason =
   | "form-state"
   | "session-expired"
   | "mutation-observed"
+  | "destination-not-ready"
   | "probe-failed"
   | "target-limit"
   | "max-depth";
@@ -227,6 +228,11 @@ export async function discoverRuntimeNavigation(
       }
       if (!probe.interaction.performed || !probe.after || !probe.transition) {
         graph.transitions.push(edgeFromProbe(node.id, null, probe, ["probe-failed"], target.discovery));
+        continue;
+      }
+      if (probe.after.readiness.status === "partial") {
+        graph.transitions.push(edgeFromProbe(node.id, null, probe, ["destination-not-ready"],
+          target.discovery, "destination-readiness-timeout"));
         continue;
       }
 

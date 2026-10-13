@@ -11,6 +11,7 @@ import {
 } from "playwright";
 import {
   captureInteractionCandidates,
+  captureDestinationReadinessBaseline,
   captureInteractiveElements,
   captureVisibleText,
   normalizeReadinessTimeout,
@@ -22,6 +23,8 @@ import {
   sanitizeAriaSnapshot,
   stableHash,
   waitForSemanticRuntimeReadiness,
+  waitForDestinationRuntimeReadiness,
+  type RuntimeDestinationBaseline,
   validateRuntimeUrl,
   withTimeout,
   type RuntimeBrowserError,
@@ -152,6 +155,7 @@ export async function probeRuntimeNavigation(
     const response = await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     const before = await captureSnapshot(page, requestedUrl, response?.status(), outputDirectory,
       "before", observers, readinessTimeoutMs, candidateTimeoutMs);
+    const destinationBaseline = await captureDestinationReadinessBaseline(page);
     const located = resolveCapturedTarget(before, options.targetId);
     const base = baseResult(requestedUrl, options.targetId, before, located.target, located.status,
       located.matches);
@@ -201,7 +205,7 @@ export async function probeRuntimeNavigation(
       }
     }
     const after = await captureSnapshot(afterPage, requestedUrl, undefined, outputDirectory,
-      "after", observers, readinessTimeoutMs, candidateTimeoutMs);
+      "after", observers, readinessTimeoutMs, candidateTimeoutMs, destinationBaseline);
     const transitionNetwork = observers.network.slice(networkStart);
     const transition = buildTransition(before, after, transitionNetwork, popupAppeared);
     return {
@@ -365,9 +369,12 @@ async function captureSnapshot(
   observers: RuntimeObservers,
   readinessTimeoutMs: number,
   candidateTimeoutMs: number,
+  destinationBaseline?: RuntimeDestinationBaseline,
 ): Promise<RuntimeCaptureManifest> {
   const capturedAt = new Date().toISOString();
-  const readiness = await waitForSemanticRuntimeReadiness(page, readinessTimeoutMs);
+  const readiness = destinationBaseline
+    ? await waitForDestinationRuntimeReadiness(page, readinessTimeoutMs, destinationBaseline)
+    : await waitForSemanticRuntimeReadiness(page, readinessTimeoutMs);
   const issues: RuntimeCaptureIssue[] = [];
   const finalUrl = sanitizeRuntimeUrl(page.url());
   let title = "";

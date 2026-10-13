@@ -281,6 +281,7 @@ export function buildKnowledgeEvidencePackage(input: BuildKnowledgeEvidencePacka
 function addUiClaims(claims: KnowledgeClaim[], feature: FeatureCandidate, runtime: RuntimeNavigationDiscoveryGraph,
   reconciliation: ReconciliationManifest, policy: KnowledgeClaimPolicy): void {
   for (const item of feature.ui) {
+    if (item.scope === "shared-shell") continue;
     const runtimeElements = item.runtime.flatMap((ref) => ref.stateId ? runtimeElementsByRef(runtime, ref.stateId, ref.elementId, ref.candidateId) : []);
     const role = runtimeElements[0]?.role ?? ""; const label = safeText(item.label);
     if (!label) continue;

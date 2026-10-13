@@ -6,12 +6,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, test } from "node:test";
+import { chromium } from "playwright";
 import {
+  captureDestinationReadinessBaseline,
   captureRuntimePage,
   DEFAULT_RUNTIME_VIEWPORT,
   RuntimeCaptureError,
   sanitizeRuntimeUrl,
   validateRuntimeUrl,
+  waitForDestinationRuntimeReadiness,
 } from "../src/runtime-capture.js";
 
 const execFileAsync = promisify(execFile);
@@ -489,6 +492,82 @@ test("runtime CLI writes a serializable manifest and honors output directory", a
   assert.equal(manifest.page.title, "Login");
   assert.equal(path.dirname(manifest.screenshot.path), outputDirectory);
 });
+
+test("destination readiness accepts content that appears after a 3-5 second render delay", async () => {
+  await withDestinationPage(async (page) => {
+    await page.setContent('<nav><button>Settings</button></nav><main><div role="progressbar">Loading</div></main>');
+    const baseline = await captureDestinationReadinessBaseline(page);
+    await page.evaluate(() => setTimeout(() => {
+      document.querySelector("main")!.innerHTML = "<h1>Domain and Email</h1><button>Configure</button>";
+    }, 3_200));
+    const readiness = await waitForDestinationRuntimeReadiness(page, 5_000, baseline);
+    assert.equal(readiness.status, "ready");
+    assert.equal(readiness.reason, "destination-content");
+    assert.ok((readiness.elapsedMs ?? 0) >= 3_000);
+  });
+});
+
+test("destination readiness rejects a spinner, shared shell, and unchanged controls", async () => {
+  await withDestinationPage(async (page) => {
+    await page.setContent('<nav><button>Settings</button></nav><main><div role="progressbar">Loading</div></main>');
+    const baseline = await captureDestinationReadinessBaseline(page);
+    const readiness = await waitForDestinationRuntimeReadiness(page, 350, baseline);
+    assert.equal(readiness.status, "partial");
+    assert.equal(readiness.reason, "destination-timeout");
+    assert.equal(readiness.observation?.loadingIndicatorCount, 1);
+    assert.equal(readiness.observation?.destinationEvidenceCount, 0);
+  });
+});
+
+test("destination readiness recognizes non-heading content and reused shell controls", async () => {
+  await withDestinationPage(async (page) => {
+    await page.setContent('<nav><button>Settings</button></nav><main><p>Choose an area</p></main>');
+    const baseline = await captureDestinationReadinessBaseline(page);
+    await page.locator("main").evaluate((main) => { main.innerHTML = "<p>Mail delivery status</p><button>Settings</button>"; });
+    const readiness = await waitForDestinationRuntimeReadiness(page, 800, baseline);
+    assert.equal(readiness.status, "ready");
+    assert.ok((readiness.observation?.destinationEvidenceCount ?? 0) > 0);
+  });
+});
+
+test("destination readiness accepts explicit errors and minimal meaningful destination content", async () => {
+  await withDestinationPage(async (page) => {
+    await page.setContent("<main></main>");
+    const errorBaseline = await captureDestinationReadinessBaseline(page);
+    await page.locator("main").evaluate((main) => { main.innerHTML = '<div role="alert">Unable to load settings</div>'; });
+    assert.equal((await waitForDestinationRuntimeReadiness(page, 800, errorBaseline)).status, "ready");
+
+    await page.setContent("<main></main>");
+    const minimalBaseline = await captureDestinationReadinessBaseline(page);
+    await page.locator("main").evaluate((main) => { main.innerHTML = '<button aria-label="Open mailbox settings"></button>'; });
+    assert.equal((await waitForDestinationRuntimeReadiness(page, 800, minimalBaseline)).status, "ready");
+  });
+});
+
+test("destination readiness stabilizes on final content instead of an intermediate state", async () => {
+  await withDestinationPage(async (page) => {
+    await page.setContent("<main><p>Initial</p></main>");
+    const baseline = await captureDestinationReadinessBaseline(page);
+    await page.evaluate(() => {
+      setTimeout(() => { document.querySelector("main")!.innerHTML = "<p>Preparing settings</p>"; }, 20);
+      setTimeout(() => { document.querySelector("main")!.innerHTML = "<h1>Domain and Email</h1>"; }, 250);
+    });
+    const readiness = await waitForDestinationRuntimeReadiness(page, 1_200, baseline);
+    assert.equal(readiness.status, "ready");
+    assert.equal(await page.locator("main").innerText(), "Domain and Email");
+    assert.ok((readiness.elapsedMs ?? 0) >= 400);
+  });
+});
+
+async function withDestinationPage(run: (page: import("playwright").Page) => Promise<void>): Promise<void> {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await run(page);
+  } finally {
+    await browser.close();
+  }
+}
 
 function artifactDirectory(name: string): string {
   const directory = path.join(

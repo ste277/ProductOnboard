@@ -114,6 +114,56 @@ test("derives selected parameterized route identity from literals and stable bin
   assert.equal(root.nameSource.type, "route-literal");
 });
 
+test("uses observed destination labels over shared route components and scopes shared shell evidence", () => {
+  const input = sharedRouteFixture();
+  const first = buildFeatureModel(input);
+  const second = buildFeatureModel(input);
+  assert.deepEqual(second, first);
+  const mail = first.features.find((item) => item.runtimeStates.includes("state-mail"))!;
+  const billing = first.features.find((item) => item.runtimeStates.includes("state-billing"))!;
+  assert.equal(mail.name, "Domain and Email");
+  assert.equal(mail.nameSource.type, "runtime-navigation-label");
+  assert.equal(mail.staticAssociation, "shared-shell");
+  assert.equal(billing.name, "Billing & Invoice");
+  assert.notEqual(mail.id, billing.id);
+  assert.equal(mail.ui.find((item) => item.label === "Settings")?.scope, "shared-shell");
+  assert.equal(mail.ui.find((item) => item.label === "Outgoing mail server")?.scope, "feature-specific");
+  assert.equal(mail.ui.some((item) => item.label === "Invoice schedule"), false);
+  assert.ok(mail.provenance.runtimeTransitionIds.includes("transition-mail"));
+});
+
+test("prefers a runtime page heading over an internal shared component name", () => {
+  const input = sharedRouteFixture();
+  input.runtimeDiscovery.nodes.find((item) => item.id === "state-mail")!.semanticElements.push(
+    element("heading-mail", "h1", "heading", "Email delivery", "Email delivery"));
+  input.reconciliation = reconcileProductEvidence({ staticGraph: input.staticGraph, runtimeDiscovery: input.runtimeDiscovery });
+  const mail = buildFeatureModel(input).features.find((item) => item.runtimeStates.includes("state-mail"))!;
+  assert.equal(mail.name, "Email delivery");
+  assert.equal(mail.nameSource.type, "runtime-heading");
+});
+
+test("does not select ambiguous runtime navigation labels", () => {
+  const input = sharedRouteFixture();
+  input.runtimeDiscovery.transitions.push(transition("transition-mail-alias", "state-settings", "state-mail", "Mail configuration"));
+  input.reconciliation = reconcileProductEvidence({ staticGraph: input.staticGraph, runtimeDiscovery: input.runtimeDiscovery });
+  const mail = buildFeatureModel(input).features.find((item) => item.runtimeStates.includes("state-mail"))!;
+  assert.equal(mail.name, "SharedApplicationShell");
+  assert.equal(mail.nameSource.type, "component");
+});
+
+test("retains explicit shared-shell association when route-specific observations are missing", () => {
+  const input = sharedRouteFixture();
+  input.runtimeDiscovery.transitions = [];
+  input.runtimeDiscovery.nodes.find((item) => item.id === "state-mail")!.semanticElements = [
+    element("shared-settings", "button", "button", "Settings", "Settings"),
+  ];
+  input.reconciliation = reconcileProductEvidence({ staticGraph: input.staticGraph, runtimeDiscovery: input.runtimeDiscovery });
+  const mail = buildFeatureModel(input).features.find((item) => item.runtimeStates.includes("state-mail"))!;
+  assert.equal(mail.name, "SharedApplicationShell");
+  assert.equal(mail.staticAssociation, "shared-shell");
+  assert.equal(mail.ui.every((item) => item.scope === "shared-shell"), true);
+});
+
 test("uses stable runtime structure while excluding opaque ticket identifiers and grouping instances", () => {
   const input = routeIdentityFixture(["/:type/:id/:page"], [
     ["state-ticket-a", "https://app.test/#/tickets/123456/ticket"],
@@ -310,6 +360,31 @@ function routeIdentityFixture(patterns: string[], states: Array<[string, string]
     transitions: [], skippedTargets: [], stopReasons: ["completed"], summary: { statesDiscovered: runtimeStates.length,
       transitionsObserved: 0, failedTransitions: 0, targetsSkipped: 0, blocked: 0, unknown: 0, boundaryStates: 0,
       mutationStopBranches: 0, maxDepthReached: 0 },
+  };
+  return { staticGraph, runtimeDiscovery, reconciliation: reconcileProductEvidence({ staticGraph, runtimeDiscovery }) };
+}
+
+function sharedRouteFixture() {
+  const route = staticNode("shared-route", "route", "/onboard/:page", { path: value("/onboard/:page") });
+  const shell = staticNode("shared-component", "component", "SharedApplicationShell", {});
+  const staticGraph: ProductEvidenceGraph = { root: "/shared-route-fixture", nodes: [route, shell],
+    edges: [edge("shared-route-renders", "ROUTE_RENDERS_COMPONENT", route.id, shell.id)], unresolved: [] };
+  const settings = state("state-settings", "https://app.test/settings", "Settings", [], []);
+  const mail = state("state-mail", "https://app.test/#/onboard/mailserver", "Application", [
+    element("shared-settings", "button", "button", "Settings", "Settings"),
+    element("mail-control", "button", "button", "Outgoing mail server", "Outgoing mail server"),
+  ], []);
+  const billing = state("state-billing", "https://app.test/#/onboard/billing", "Application", [
+    element("shared-settings", "button", "button", "Settings", "Settings"),
+    element("billing-control", "button", "button", "Invoice schedule", "Invoice schedule"),
+  ], []);
+  const runtimeDiscovery: RuntimeNavigationDiscoveryGraph = {
+    startUrl: settings.url, startOrigin: "https://app.test", allowedOrigins: ["https://app.test"],
+    limits: { maxDepth: 2, maxStates: 10, maxTransitions: 10, maxTargetsPerState: 10 }, nodes: [settings, mail, billing],
+    transitions: [transition("transition-mail", settings.id, mail.id, "Domain and Email"),
+      transition("transition-billing", settings.id, billing.id, "Billing & Invoice")], skippedTargets: [], stopReasons: ["completed"],
+    summary: { statesDiscovered: 3, transitionsObserved: 2, failedTransitions: 0, targetsSkipped: 0, blocked: 0,
+      unknown: 0, boundaryStates: 0, mutationStopBranches: 0, maxDepthReached: 1 },
   };
   return { staticGraph, runtimeDiscovery, reconciliation: reconcileProductEvidence({ staticGraph, runtimeDiscovery }) };
 }

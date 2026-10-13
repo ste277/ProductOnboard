@@ -1,4 +1,4 @@
-import { stableHash } from "./runtime-capture.js";
+import { normalizeText, stableHash } from "./runtime-capture.js";
 import type {
   ProductEvidenceEdge,
   ProductEvidenceGraph,
@@ -20,6 +20,7 @@ export type FeatureNameSourceType =
   | "primary-action"
   | "static-heading"
   | "runtime-heading"
+  | "runtime-navigation-label"
   | "component"
   | "route-literal"
   | "route-bound-value"
@@ -80,6 +81,7 @@ export interface FeatureEvidenceItem {
   static: FeatureStaticReference[];
   runtime: FeatureRuntimeReference[];
   reconciliationIds: string[];
+  scope?: "feature-specific" | "shared-shell";
 }
 
 export interface FeatureEntryPoint {
@@ -111,6 +113,7 @@ export interface FeatureCandidate {
   id: string;
   name: string;
   nameSource: FeatureNameSource;
+  staticAssociation: "route-specific" | "shared-shell" | "runtime-only";
   routeIdentity?: FeatureRouteIdentity;
   root: { type: "static-route" | "static-navigation" | "runtime-state"; evidenceId: string };
   entryPoints: FeatureEntryPoint[];
@@ -274,23 +277,26 @@ function buildFeature(seed: FeatureSeed, input: BuildFeatureModelInput,
     result.runtime.some((ref) => seed.states.some((state) => ref.stateId === state.id) ||
       Boolean(ref.transitionId && transitionIds.includes(ref.transitionId)))));
   const routeIdentity = buildRouteIdentity(seed, reconciliation);
-  const name = chooseName(seed, navigationNodes, input.staticGraph, uiIds, eventIds, routeIdentity);
+  const name = chooseName(seed, navigationNodes, input.staticGraph, input.runtimeDiscovery, uiIds, eventIds, routeIdentity);
+  const sharedRuntimeIds = sharedRuntimeEvidenceIds(seed, input.runtimeDiscovery, reconciliation);
+  const sharedStaticRoute = Boolean(seed.route && normalizedRoute(seed.route).includes(":") && seed.states.length > 0);
   const id = `feature:${stableHash(JSON.stringify({ root: seed.rootType,
     route: seed.route ? normalizedRoute(seed.route) : staticValue(seed.navigation?.data.destination) ?? "",
     state: seed.identityKey ? seed.identityKey : seed.rootType === "runtime-state" || seed.rootId !== seed.route?.id
       ? seed.states.map((item) => item.fingerprint).sort() : [] }))}`;
   const routes = seed.route ? [evidenceItem(seed.route, "route", relevantResults)] : [];
-  const ui = uiIds.map((nodeId) => evidenceItem(node(input.staticGraph, nodeId), "ui", relevantResults));
+  const ui = uiIds.map((nodeId) => ({ ...evidenceItem(node(input.staticGraph, nodeId), "ui", relevantResults),
+    ...(sharedStaticRoute ? { scope: "shared-shell" as const } : {}) }));
   for (const state of seed.states) {
     for (const element of state.semanticElements) if (!ui.some((item) => item.runtime.some((ref) => ref.elementId === element.id))) {
       const result = relevantResults.find((item) => item.runtime.some((ref) => ref.stateId === state.id && ref.elementId === element.id));
       ui.push(runtimeItem("ui", element.id, element.accessibleName || element.visibleText || element.type, state.id,
-        { elementId: element.id }, result));
+        { elementId: element.id }, result, sharedRuntimeIds.has(`semantic|${element.id}`) ? "shared-shell" : "feature-specific"));
     }
     for (const candidate of state.interactionCandidates) if (!ui.some((item) => item.runtime.some((ref) => ref.candidateId === candidate.id))) {
       const result = relevantResults.find((item) => item.runtime.some((ref) => ref.stateId === state.id && ref.candidateId === candidate.id));
       ui.push(runtimeItem("ui", candidate.id, candidate.accessibleName || candidate.text || candidate.tag, state.id,
-        { candidateId: candidate.id }, result));
+        { candidateId: candidate.id }, result, sharedRuntimeIds.has(`candidate|${candidate.id}`) ? "shared-shell" : "feature-specific"));
     }
   }
   const actions = [...eventIds.map((nodeId) => evidenceItem(node(input.staticGraph, nodeId), "action", relevantResults)),
@@ -303,7 +309,9 @@ function buildFeature(seed: FeatureSeed, input: BuildFeatureModelInput,
   const screenshots = seed.states.filter((state) => state.screenshot.captured).map((state) => ({ runtimeStateId: state.id,
     path: state.screenshot.path, width: state.screenshot.width, height: state.screenshot.height, captured: true }));
   return {
-    id, name: name.name, nameSource: name.source, ...(routeIdentity ? { routeIdentity } : {}),
+    id, name: name.name, nameSource: name.source,
+    staticAssociation: !seed.route ? "runtime-only" : sharedStaticRoute ? "shared-shell" : "route-specific",
+    ...(routeIdentity ? { routeIdentity } : {}),
     root: { type: seed.rootType, evidenceId: seed.rootId },
     entryPoints: entryPoints(navigationNodes, seed.states, input.runtimeDiscovery), routes,
     runtimeStates: seed.states.map((state) => state.id).sort(), ui: ui.sort(compareItem), actions: actions.sort(compareItem),
@@ -317,6 +325,7 @@ function buildFeature(seed: FeatureSeed, input: BuildFeatureModelInput,
 }
 
 function chooseName(seed: FeatureSeed, navigation: ProductEvidenceNode[], graph: ProductEvidenceGraph,
+  runtime: RuntimeNavigationDiscoveryGraph,
   uiIds: string[], eventIds: string[], routeIdentity?: FeatureRouteIdentity): { name: string; source: FeatureNameSource } {
   const nav = navigation.find((item) => staticValue(item.data.label));
   if (nav) return named(staticValue(nav.data.label)!, "navigation-label", nav.id);
@@ -329,6 +338,8 @@ function chooseName(seed: FeatureSeed, navigation: ProductEvidenceNode[], graph:
     const heading = state.semanticElements.find((item) => item.role === "heading" && (item.accessibleName || item.visibleText));
     if (heading) return named(heading.accessibleName || heading.visibleText!, "runtime-heading", heading.id);
   }
+  const runtimeNavigationName = runtimeNavigationLabel(seed, runtime);
+  if (runtimeNavigationName) return named(runtimeNavigationName.label, "runtime-navigation-label", runtimeNavigationName.evidenceId);
   const componentId = seed.route && outgoing(graph, seed.route.id, "ROUTE_RENDERS_COMPONENT")[0]?.to;
   if (componentId) return named(node(graph, componentId).label, "component", componentId);
   if (routeIdentity) return routeIdentityName(routeIdentity);
@@ -354,10 +365,49 @@ function evidenceItem(item: ProductEvidenceNode, kind: FeatureEvidenceItem["kind
 }
 
 function runtimeItem(kind: FeatureEvidenceItem["kind"], evidenceId: string, label: string, stateId: string,
-  ref: Partial<FeatureRuntimeReference>, result?: ReconciledEvidenceResult): FeatureEvidenceItem {
+  ref: Partial<FeatureRuntimeReference>, result?: ReconciledEvidenceResult,
+  scope?: FeatureEvidenceItem["scope"]): FeatureEvidenceItem {
   return { id: `feature-evidence:${stableHash(`${kind}|${stateId}|${evidenceId}`)}`, kind, label,
     status: result?.status ?? "runtime", static: [], runtime: [{ stateId, ...ref }],
-    reconciliationIds: result ? [result.id] : [] };
+    reconciliationIds: result ? [result.id] : [], ...(scope ? { scope } : {}) };
+}
+
+function runtimeNavigationLabel(seed: FeatureSeed, runtime: RuntimeNavigationDiscoveryGraph):
+  { label: string; evidenceId: string } | undefined {
+  const stateIds = new Set(seed.states.map((state) => state.id));
+  const observed = runtime.transitions.filter((edge) => edge.to && stateIds.has(edge.to) && edge.status === "observed")
+    .map((edge) => ({ label: transitionTargetLabel(edge), evidenceId: edge.id })).filter((item) => item.label);
+  for (const state of seed.states) {
+    const currentPath = runtimeRoute(state.url);
+    for (const element of state.semanticElements) {
+      if (element.role !== "link" || !element.resolvedHref) continue;
+      if (runtimeRoute(element.resolvedHref) === currentPath) observed.push({
+        label: normalizeText(element.accessibleName || element.visibleText || ""), evidenceId: element.id });
+    }
+  }
+  const labels = unique(observed.map((item) => item.label));
+  return labels.length === 1 ? observed.find((item) => item.label === labels[0]) : undefined;
+}
+
+function sharedRuntimeEvidenceIds(seed: FeatureSeed, runtime: RuntimeNavigationDiscoveryGraph,
+  reconciliation: ReconciledEvidenceResult[]): Set<string> {
+  if (!seed.route || !normalizedRoute(seed.route).includes(":")) return new Set();
+  const own = new Set(seed.states.map((state) => state.id));
+  const siblings = reconciliation.filter((item) => item.domain === "route" && item.status === "corroborated" &&
+    item.static.some((ref) => ref.nodeId === seed.route!.id)).flatMap((item) => item.runtime.flatMap((ref) =>
+      ref.stateId && !own.has(ref.stateId) ? runtime.nodes.filter((state) => state.id === ref.stateId) : []));
+  const siblingIds = new Set(siblings.flatMap((state) => [
+    ...state.semanticElements.map((item) => `semantic|${item.id}`),
+    ...state.interactionCandidates.map((item) => `candidate|${item.id}`),
+  ]));
+  return siblingIds;
+}
+
+function transitionTargetLabel(edge: RuntimeTransitionEdge): string {
+  if (!edge.target) return "";
+  return normalizeText(edge.target.source === "semantic-element"
+    ? edge.target.accessibleName || edge.target.visibleText || ""
+    : edge.target.accessibleName || edge.target.text || "");
 }
 
 function buildRelationships(features: FeatureCandidate[], graph: ProductEvidenceGraph,
@@ -693,6 +743,10 @@ function validNameSource(feature: FeatureCandidate, nodes: Set<string>, states: 
   }
   if (["route-literal", "route-bound-value", "runtime-route-structure", "route-pattern"].includes(feature.nameSource.type)) {
     return feature.routeIdentity?.selectedReconciliationIds.includes(feature.nameSource.evidenceId) ?? false;
+  }
+  if (feature.nameSource.type === "runtime-navigation-label") {
+    return runtime.transitions.some((edge) => edge.id === feature.nameSource.evidenceId) || runtime.nodes.some((state) =>
+      state.semanticElements.some((item) => item.id === feature.nameSource.evidenceId));
   }
   if (states.has(feature.nameSource.evidenceId)) return true;
   return runtime.nodes.some((state) => state.semanticElements.some((item) => item.id === feature.nameSource.evidenceId) ||

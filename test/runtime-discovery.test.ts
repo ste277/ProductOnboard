@@ -53,6 +53,8 @@ beforeEach(async () => {
     if (url.pathname === "/mutation") return html(response,
       "<!doctype html><title>Mutation State</title><h1>Mutation State</h1><a href='/dashboard'>Should Not Expand</a>");
     if (url.pathname === "/ranked") return html(response, rankedFixture());
+    if (url.pathname === "/stalled") return html(response,
+      '<!doctype html><title>Stalled</title><main><h1>Shell</h1><a href="#/pending">Pending area</a></main>');
     return html(response, homeFixture(boundaryUrl));
   });
   await listen(server);
@@ -82,6 +84,17 @@ test("discovers a deterministic bounded graph with links, cycles, duplicate path
   assert.ok(graph.nodes.some((node) => node.stopReasons.includes("form-state")));
   assert.ok(graph.nodes.every((node) => node.screenshot.path && node.accessibility.snapshot !== undefined));
   assert.ok(graph.summary.statesDiscovered > 1);
+});
+
+test("preserves a destination timeout edge without promoting incomplete content", async () => {
+  const graph = await discoverRuntimeNavigation({ startUrl: `${baseUrl}/stalled`, outputDirectory: artifacts("stalled"),
+    limits: { maxDepth: 1, maxStates: 3, maxTransitions: 2, maxTargetsPerState: 2 },
+    settleTimeoutMs: 100, readinessTimeoutMs: 350 });
+  assert.equal(graph.nodes.length, 1);
+  assert.equal(graph.transitions.length, 1);
+  assert.equal(graph.transitions[0]?.to, null);
+  assert.equal(graph.transitions[0]?.failure, "destination-readiness-timeout");
+  assert.deepEqual(graph.transitions[0]?.stopReasons, ["destination-not-ready"]);
 });
 
 test("skips unknown, blocked, form, submit, and external-link targets without activating them", async () => {
@@ -271,7 +284,7 @@ function targetText(target: NonNullable<Awaited<ReturnType<typeof discoverRuntim
 function homeFixture(external: string): string {
   return `<!doctype html><title>Home</title><h1>Home</h1>
     <a href="/dashboard">Dashboard</a><a href="/tickets">Tickets</a><a href="/settings">Settings</a>
-    <a href="/settings">Settings Duplicate</a><a href="#/tickets">Hash Tickets</a>
+    <a href="/settings">Settings Duplicate</a><a id="hash-tickets" href="#/tickets">Hash Tickets</a>
     <a href="https://example.test/docs">External Docs</a><a href="/mutation" id="reports">Explore Reports</a>
     <label>Search <input type="search"></label><form action="/submitted"><button type="submit">Submit Search</button></form>
     <button onclick="fetch('/deleted')">Delete Account</button><button>Ordinary Action</button>
@@ -283,6 +296,9 @@ function homeFixture(external: string): string {
         document.body.innerHTML = '<h1>Email Login</h1><label>Email <input aria-label="Email"></label><button>Next</button>';
       });
       document.querySelector('#technician').addEventListener('click', () => location.href = ${JSON.stringify(`${external}/auth-boundary`)});
+      document.querySelector('#hash-tickets').addEventListener('click', () => {
+        document.body.insertAdjacentHTML('beforeend', '<main><h1>Hash Tickets</h1></main>');
+      });
       document.querySelector('#reports').addEventListener('click', () => fetch('/api/surprise', { method: 'POST', body: 'private' }));
     </script>`;
 }

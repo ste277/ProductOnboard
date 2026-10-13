@@ -247,7 +247,7 @@ function html(response: import("node:http").ServerResponse, body: string): void 
 function probeFixture(): string {
   return `<!doctype html><title>Probe Fixture</title>
     <a href="/dashboard">Dashboard</a>
-    <a href="#/tickets">Tickets</a>
+    <a id="tickets-link" href="#/tickets">Tickets</a>
     <a href="https://example.test/docs">External Docs</a>
     <a href="javascript:void(0)">JavaScript Link</a>
     <a href="data:text/plain,no">Data Link</a>
@@ -272,6 +272,9 @@ function probeFixture(): string {
       <div id="delete-custom" style="cursor:pointer">Delete account</div>
     </div>
     <script>
+      document.querySelector('#tickets-link').addEventListener('click', () => {
+        document.body.insertAdjacentHTML('beforeend', '<section><h1>Tickets</h1></section>');
+      });
       document.querySelector('#login').addEventListener('click', () => {
         location.hash = '/login/requester';
         document.body.insertAdjacentHTML('beforeend', '<section><label>Username <input aria-label="Username"></label><label>Password <input type="password" aria-label="Password"></label><button>Sign In</button></section>');
@@ -292,7 +295,8 @@ function probeFixture(): string {
       });
       for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
         document.querySelector('#mutation-' + method.toLowerCase()).addEventListener('click', () =>
-          fetch('/api/unexpected-' + method.toLowerCase(), { method, body: 'private' }));
+          { document.body.insertAdjacentHTML('beforeend', '<section><h2>Mutation observed</h2></section>');
+            fetch('/api/unexpected-' + method.toLowerCase(), { method, body: 'private' }); });
       }
     </script>`;
 }

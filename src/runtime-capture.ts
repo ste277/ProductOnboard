@@ -164,7 +164,7 @@ export interface RuntimeCaptureManifest {
   };
   readiness: {
     status: "ready" | "partial";
-    reason: "semantic-ui" | "semantic-timeout" | "network-idle" | "network-active";
+    reason: "semantic-ui" | "semantic-timeout" | "destination-content" | "destination-timeout" | "network-idle" | "network-active";
     timeoutMs: number;
     elapsedMs?: number;
     observation?: RuntimeReadinessObservation;
@@ -194,6 +194,13 @@ export interface RuntimeReadinessObservation {
   interactiveControlCount: number;
   navigationControlCount: number;
   stablePolls: number;
+  destinationEvidenceCount?: number;
+  loadingIndicatorCount?: number;
+}
+
+export interface RuntimeDestinationBaseline {
+  contentSignature: string;
+  semanticSignatures: string[];
 }
 
 export type RuntimeCaptureFailureStage =
@@ -509,6 +516,77 @@ export async function waitForSemanticRuntimeReadiness(
   }
   return { status: "partial", reason: "semantic-timeout", timeoutMs: boundedTimeout,
     elapsedMs: Date.now() - started, observation };
+}
+
+export async function captureDestinationReadinessBaseline(page: Page): Promise<RuntimeDestinationBaseline> {
+  const sample = await readDestinationContent(page);
+  return { contentSignature: sample.contentSignature, semanticSignatures: sample.semanticSignatures };
+}
+
+export async function waitForDestinationRuntimeReadiness(page: Page, timeoutMs: number,
+  baseline: RuntimeDestinationBaseline): Promise<RuntimeCaptureManifest["readiness"]> {
+  const boundedTimeout = normalizeReadinessTimeout(timeoutMs);
+  const started = Date.now();
+  let previousSignature = ""; let stablePolls = 0;
+  let observation: RuntimeReadinessObservation = { visibleTextLength: 0, interactiveControlCount: 0,
+    navigationControlCount: 0, stablePolls: 0, destinationEvidenceCount: 0, loadingIndicatorCount: 0 };
+  while (Date.now() - started < boundedTimeout) {
+    const [semantic, destination] = await Promise.all([readSemanticReadiness(page), readDestinationContent(page)]);
+    const baselineSemantic = new Set(baseline.semanticSignatures);
+    const newSemantic = destination.semanticSignatures.filter((item) => !baselineSemantic.has(item));
+    const contentChanged = destination.contentSignature !== baseline.contentSignature;
+    const evidenceCount = newSemantic.length + Number(contentChanged) + Number(destination.errorState);
+    const signature = `${destination.contentSignature}|${destination.semanticSignatures.join("|")}|${destination.loadingIndicatorCount}`;
+    stablePolls = signature === previousSignature ? stablePolls + 1 : 1; previousSignature = signature;
+    observation = { ...semantic, stablePolls, destinationEvidenceCount: evidenceCount,
+      loadingIndicatorCount: destination.loadingIndicatorCount };
+    if (evidenceCount > 0 && destination.loadingIndicatorCount === 0 && stablePolls >= 2) {
+      return { status: "ready", reason: "destination-content", timeoutMs: boundedTimeout,
+        elapsedMs: Date.now() - started, observation };
+    }
+    await page.waitForTimeout(Math.min(200, Math.max(1, boundedTimeout - (Date.now() - started))));
+  }
+  return { status: "partial", reason: "destination-timeout", timeoutMs: boundedTimeout,
+    elapsedMs: Date.now() - started, observation };
+}
+
+async function readDestinationContent(page: Page): Promise<{ contentSignature: string; semanticSignatures: string[];
+  loadingIndicatorCount: number; errorState: boolean }> {
+  return page.evaluate(() => {
+    const roots = [...document.querySelectorAll("main,[role=main]")].filter((element) => {
+      const html = element as HTMLElement; const style = getComputedStyle(html); const rect = html.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
+        rect.width > 0 && rect.height > 0;
+    });
+    const root = roots[0] ?? document.body;
+    const loading = [...root.querySelectorAll('[role="progressbar"],[aria-busy="true"],[data-loading="true"],.loading,.spinner')]
+      .filter((element) => { const html = element as HTMLElement; const style = getComputedStyle(html);
+        const rect = html.getBoundingClientRect(); return style.display !== "none" && style.visibility !== "hidden" &&
+          Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0; });
+    const selectors = 'h1,h2,h3,[role="heading"],button,a[href],input,select,textarea,[role="tab"],[role="menuitem"],[role="alert"]';
+    const semanticSignatures = [...root.querySelectorAll(selectors)].filter((element) => {
+      const html = element as HTMLElement; const style = getComputedStyle(html); const rect = html.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
+        rect.width > 0 && rect.height > 0;
+    }).map((element) => {
+      const html = element as HTMLElement;
+      return [element.tagName.toLowerCase(), element.getAttribute("role") ?? "", element.getAttribute("aria-label") ?? "",
+        element.getAttribute("name") ?? "", (html.innerText || element.getAttribute("placeholder") || "").replace(/\s+/g, " ").trim()]
+        .join(":");
+    }).filter((item) => item.replace(/:/g, "").trim()).sort();
+    const text = ((root as HTMLElement | undefined)?.innerText ?? "").replace(/\s+/g, " ").trim();
+    const structure = [...root.querySelectorAll("section,article,form,table,[role=dialog],[role=alert]")]
+      .filter((element) => { const html = element as HTMLElement; const style = getComputedStyle(html);
+        const rect = html.getBoundingClientRect(); return style.display !== "none" && style.visibility !== "hidden" &&
+          Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0; })
+      .map((element) => `${element.tagName}:${element.getAttribute("role") ?? ""}`).sort();
+    return { contentSignature: `${text}|${structure.join(",")}`, semanticSignatures,
+      loadingIndicatorCount: loading.length, errorState: [...root.querySelectorAll('[role="alert"]')].some((element) => {
+        const html = element as HTMLElement; const style = getComputedStyle(html); const rect = html.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
+          rect.width > 0 && rect.height > 0;
+      }) };
+  });
 }
 
 async function readSemanticReadiness(page: Page): Promise<Omit<RuntimeReadinessObservation, "stablePolls">> {
