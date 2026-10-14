@@ -447,3 +447,10 @@ export {
   type DocsWorkspaceServerOptions,
   type RunningDocsWorkspaceServer,
 } from "./docs-workspace-server.js";
+
+export type {
+  DocumentExport,
+  DocumentExportFormat,
+  DocumentExportRecord,
+  ExportAvailability,
+} from "./docs-workspace-export.js";

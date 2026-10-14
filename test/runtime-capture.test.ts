@@ -15,6 +15,7 @@ import {
   sanitizeRuntimeUrl,
   validateRuntimeUrl,
   waitForDestinationRuntimeReadiness,
+  waitForSemanticRuntimeReadiness,
 } from "../src/runtime-capture.js";
 
 const execFileAsync = promisify(execFile);
@@ -357,7 +358,8 @@ test("preserves partial evidence and diagnostics when semantic readiness never a
   assert.equal(capture.readiness.timeoutMs, 350);
   assert.ok((capture.readiness.elapsedMs ?? 0) >= 350);
   assert.deepEqual(capture.readiness.observation, { visibleTextLength: 0, interactiveControlCount: 0,
-    navigationControlCount: 0, stablePolls: 2 });
+    navigationControlCount: 0, stablePolls: 2, destinationEvidenceCount: 0, loadingIndicatorCount: 0 });
+  assert.equal(capture.readiness.timeoutReason, "no-substantive-destination-content");
   assert.equal(capture.screenshot.captured, true);
 });
 
@@ -556,6 +558,71 @@ test("destination readiness stabilizes on final content instead of an intermedia
     assert.equal(readiness.status, "ready");
     assert.equal(await page.locator("main").innerText(), "Domain and Email");
     assert.ok((readiness.elapsedMs ?? 0) >= 400);
+  });
+});
+
+test("initial readiness rejects the Create Ticket shell even with stable utility controls", async () => {
+  await withDestinationPage(async (page) => {
+    for (const loader of ['', '<div class="preloader" style="width:20px;height:20px"></div>', '<span>Fetching content...</span>']) {
+      await page.setContent(`<a href="#content">Skip to content</a><nav><h1>Application</h1><button>Settings</button></nav>
+        <main id="content"><div role="tablist"><button role="tab">Dashboard</button></div>${loader}</main>`);
+      const result = await waitForSemanticRuntimeReadiness(page, 350);
+      assert.equal(result.status, "partial");
+      assert.equal(result.predicate, "initial-route-content-v1");
+      assert.equal(result.observation?.destinationEvidenceCount, 0);
+      assert.equal(result.timeoutReason, loader ? "visible-loading-state" : "no-substantive-destination-content");
+      assert.ok((result.observation?.interactiveControlCount ?? 0) > 0);
+    }
+    await page.setContent('<a href="#content"><p>Skip to application content</p></a><ul><li><a href="/dashboard"><h3>Dashboard</h3></a></li><li><a href="/settings">Settings</a></li></ul>');
+    const linkShell = await waitForSemanticRuntimeReadiness(page, 350);
+    assert.equal(linkShell.status, "partial");
+    assert.equal(linkShell.observation?.destinationEvidenceCount, 0);
+  });
+});
+
+test("initial readiness waits for the delayed form instead of the navigable shell", async () => {
+  await withDestinationPage(async (page) => {
+    await page.setContent('<nav><button>Settings</button></nav><main><div class="preloader" style="width:20px;height:20px"></div></main>');
+    await page.evaluate(() => {
+      setTimeout(() => { document.querySelector("main")!.innerHTML =
+        '<h1>Create a new record</h1><label>Subject <input required></label><button>Save</button>'; }, 3_200);
+    });
+    const result = await waitForSemanticRuntimeReadiness(page, 5_000);
+    assert.equal(result.status, "ready");
+    assert.equal(result.initialObservation?.destinationEvidenceCount, 0);
+    assert.equal(result.initialObservation?.loadingIndicatorCount, 1);
+    assert.ok((result.elapsedMs ?? 0) >= 3_200);
+    assert.ok((result.elapsedMs ?? Infinity) < 5_000);
+    assert.equal(result.observation?.destinationEvidenceCount, 2);
+  });
+});
+
+test("initial readiness supports substantive dashboards, settings, tables, empty states and no main", async () => {
+  await withDestinationPage(async (page) => {
+    for (const content of [
+      '<main><h1>Dashboard</h1><dl><dt>Open items</dt><dd>12</dd></dl></main>',
+      '<main><h1>Settings</h1><label>Domain <input></label></main>',
+      '<main><table><tr><th>Subject</th></tr><tr><td>Printer unavailable</td></tr></table></main>',
+      '<main><ul><li>Printer unavailable</li><li>Keyboard unavailable</li></ul></main>',
+      '<main><h1>No records found</h1><p>There are no records matching this view.</p></main>',
+      '<div><label>Subject <input></label><button>Save</button></div>',
+    ]) {
+      await page.setContent(`<nav><button>Settings</button></nav>${content}`);
+      const result = await waitForSemanticRuntimeReadiness(page, 800);
+      assert.equal(result.status, "ready", content);
+      assert.ok((result.observation?.destinationEvidenceCount ?? 0) > 0);
+      assert.equal(result.observation?.loadingIndicatorCount, 0);
+    }
+  });
+});
+
+test("initial readiness does not accept substantive headings while a nonstandard loader remains", async () => {
+  await withDestinationPage(async (page) => {
+    await page.setContent('<main><h1>Records</h1><button>Refresh</button><div class="loading-indicator">Please wait...</div></main>');
+    const result = await waitForSemanticRuntimeReadiness(page, 350);
+    assert.equal(result.status, "partial");
+    assert.equal(result.timeoutReason, "visible-loading-state");
+    assert.ok((result.observation?.destinationEvidenceCount ?? 0) > 0);
   });
 });
 

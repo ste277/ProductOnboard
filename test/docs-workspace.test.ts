@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Script } from "node:vm";
@@ -11,6 +11,8 @@ import { FakeKnowledgeModelProvider, GroundedAiKnowledgeWriter,
   type GroundedKnowledgeWriterOutput } from "../src/grounded-ai-knowledge-writer.js";
 import type { KnowledgeEvidencePackage } from "../src/knowledge-base-generator.js";
 import type { RuntimeNavigationDiscoveryGraph } from "../src/runtime-discovery.js";
+import { assertApprovedExport, exportChecksum, exportFilename, renderApprovedExport, revisionSnapshotChecksum,
+  type DocumentExportRecord } from "../src/docs-workspace-export.js";
 
 const directories: string[] = [];
 afterEach(async () => Promise.all(directories.splice(0).map((item) => rm(item, { recursive: true, force: true }))));
@@ -252,11 +254,169 @@ test("serves workspace routes, protects APIs, persists generation, and allowlist
   } finally { await running.close(); }
 });
 
+test("exports the exact approved Markdown and standalone HTML with separate provenance and unchanged source files", async () => {
+  const fixture = await approvedWorkspaceFixture();
+  const file = path.join(fixture.data, "documents", fixture.document.id, "document.json");
+  const before = await readFile(file, "utf8");
+  const evidencePath = path.join(fixture.data, "documents", fixture.document.id, "evidence", "evidence-package.json");
+  const evidenceBefore = await readFile(evidencePath, "utf8");
+  const markdown = await fixture.workspace.exportDocument(fixture.document.id, fixture.document.currentRevisionId!, "markdown");
+  const html = await fixture.workspace.exportDocument(fixture.document.id, fixture.document.currentRevisionId!, "html");
+  assert.equal(markdown.body, fixture.document.revisions!.at(-1)!.markdown);
+  assert.match(markdown.body, /\[your support email address\]/);
+  assert.doesNotMatch(markdown.body, /support@tenant|\.png|\/Users\//);
+  assert.match(html.body, /<!doctype html>/);
+  assert.match(html.body, /<article>/);
+  assert.match(html.body, /<h1>Domain and Email<\/h1>/);
+  assert.doesNotMatch(html.body, /<script|<img|\/Users\/|Workspace|runtime-state:/);
+  assert.equal(await readFile(file, "utf8"), before);
+  assert.equal(await readFile(evidencePath, "utf8"), evidenceBefore);
+  const directory = path.join(fixture.data, "documents", fixture.document.id, "exports");
+  const records = await Promise.all((await readdir(directory)).map(async (name) =>
+    JSON.parse(await readFile(path.join(directory, name), "utf8")) as DocumentExportRecord));
+  assert.equal(records.length, 2);
+  assert.equal(markdown.record.documentId, fixture.document.id);
+  assert.equal(markdown.record.revisionId, fixture.document.currentRevisionId);
+  assert.equal(markdown.record.resultChecksum, exportChecksum(markdown.body));
+  assert.equal(html.record.resultChecksum, exportChecksum(html.body));
+  assert.equal(markdown.record.evidencePackageChecksum, fixture.document.evidencePackageChecksum);
+  assert.equal(markdown.record.revisionChecksum, fixture.document.revisions!.at(-1)!.checksum);
+  assert.equal(markdown.record.exportedAt, "2026-10-13T10:00:00.000Z");
+  assert.deepEqual(await fixture.workspace.exportAvailability(fixture.document.id),
+    { markdown: { available: true }, html: { available: true } });
+  const repeated = await fixture.workspace.exportDocument(fixture.document.id, fixture.document.currentRevisionId!, "html");
+  assert.equal(repeated.body, html.body);
+  assert.equal(repeated.record.resultChecksum, html.record.resultChecksum);
+  assert.notEqual(repeated.record.id, html.record.id);
+});
+
+test("rejects draft, revalidation-required, unsupported, tenant-warning, and unapproved revision exports", async () => {
+  const fixture = await approvedWorkspaceFixture();
+  await assert.rejects(fixture.workspace.exportDocument(fixture.document.id, fixture.document.revisions![0]!.id, "markdown"),
+    /requested revision/);
+  const document = fixture.document;
+  const revision = document.revisions!.at(-1)!;
+  const invalid = (change: (copy: DocsWorkspaceDocument) => void) => {
+    const copy = structuredClone(document);
+    change(copy);
+    return copy;
+  };
+  assert.throws(() => assertApprovedExport(invalid((copy) => { copy.reviewStatus = "draft"; }), revision.id), /approved document/);
+  for (const mutation of [
+    (copy: DocsWorkspaceDocument) => { copy.revisions!.at(-1)!.validation.status = "needs-validation"; },
+    (copy: DocsWorkspaceDocument) => { copy.revisions!.at(-1)!.validation.unsupportedStatements = 1; },
+    (copy: DocsWorkspaceDocument) => { copy.revisions!.at(-1)!.tenantWarnings.push({ id: "warning", type: "email-address",
+      blockIndex: 0, maskedValue: "s***@***.test", status: "unresolved" }); },
+  ]) {
+    const copy = invalid(mutation);
+    // Even when a fixture pins the altered snapshot, each independent eligibility gate must reject it.
+    copy.auditTrail!.at(-1)!.revisionSnapshotChecksum = revisionSnapshotChecksum(copy.revisions!.at(-1)!);
+    assert.throws(() => assertApprovedExport(copy, revision.id), /grounding|Tenant information/);
+  }
+  const saved = await fixture.workspace.saveRevision(document.id, { expectedRevisionId: revision.id, title: document.title,
+    markdown: `${revision.markdown}\nSuperOps configures all DNS records automatically.\n` });
+  await assert.rejects(fixture.workspace.exportDocument(saved.id, saved.currentRevisionId!, "html"), /approved document/);
+  const validated = await fixture.workspace.validateRevision(saved.id, saved.currentRevisionId!);
+  assert.equal(validated.revisions!.at(-1)!.validation.status, "failed");
+  await assert.rejects(fixture.workspace.exportDocument(saved.id, revision.id, "html"), /approved document/);
+});
+
+test("rejects changed approval integrity, frozen evidence, and legacy approval without export checks", async () => {
+  const fixture = await approvedWorkspaceFixture();
+  const document = fixture.document;
+  const revision = document.revisions!.at(-1)!;
+  const altered = structuredClone(document);
+  altered.revisions!.at(-1)!.markdown += "\nInjected behavior.\n";
+  assert.throws(() => assertApprovedExport(altered, revision.id), /integrity/);
+  const legacy = structuredClone(document);
+  delete legacy.auditTrail!.at(-1)!.revisionChecksum;
+  assert.throws(() => assertApprovedExport(legacy, revision.id), /Approve this revision again/);
+  const evidencePath = path.join(fixture.data, "documents", document.id, "evidence", "evidence-package.json");
+  await writeFile(evidencePath, "{}\n");
+  await assert.rejects(fixture.workspace.exportDocument(document.id, revision.id, "markdown"), /checksum mismatch/);
+});
+
+test("embeds only safely reviewed PNG images in HTML and reports Markdown packaging limitation", async () => {
+  const fixture = await approvedWorkspaceFixture(true);
+  const html = await fixture.workspace.exportDocument(fixture.document.id, fixture.document.currentRevisionId!, "html");
+  assert.match(html.body, /<img src="data:image\/png;base64,/);
+  assert.doesNotMatch(html.body, /<img[^>]+src="https?:|file:\/\/|\/tmp\//);
+  await assert.rejects(fixture.workspace.exportDocument(fixture.document.id, fixture.document.currentRevisionId!, "markdown"),
+    /Portable Markdown image packaging/);
+  const availability = await fixture.workspace.exportAvailability(fixture.document.id);
+  assert.equal(availability.html.available, true);
+  assert.equal(availability.markdown.available, false);
+  assert.match(availability.markdown.reason ?? "", /download HTML/);
+  const unsafe = structuredClone(fixture.document);
+  unsafe.revisions!.at(-1)!.screenshotReviews![0]!.safety = "known-tenant-information";
+  unsafe.revisions!.at(-1)!.checksum = exportChecksum(JSON.stringify({ title: unsafe.revisions!.at(-1)!.title,
+    markdown: unsafe.revisions!.at(-1)!.markdown, screenshots: unsafe.revisions!.at(-1)!.screenshotReviews }));
+  unsafe.auditTrail!.at(-1)!.revisionChecksum = unsafe.revisions!.at(-1)!.checksum;
+  unsafe.auditTrail!.at(-1)!.revisionSnapshotChecksum = revisionSnapshotChecksum(unsafe.revisions!.at(-1)!);
+  assert.throws(() => assertApprovedExport(unsafe, unsafe.currentRevisionId!), /unsafe review/);
+});
+
+test("escapes HTML injections, preserves semantic Markdown, and sanitizes export filenames", async () => {
+  const fixture = await approvedWorkspaceFixture();
+  const revision = structuredClone(fixture.document.revisions!.at(-1)!);
+  revision.title = '<script>alert("title")</script>';
+  revision.markdown = '# Example\n\n<script>alert("body")</script>\n\n<img src=x onerror=alert(1)>\n\n- First\n- Second\n\n1. One\n2. Two\n\n[Safe link](https://example.test/docs)\n\n[Unsafe link](javascript:alert(1))\n';
+  const html = await renderApprovedExport(revision, "html");
+  assert.doesNotMatch(html, /<script|<img|href="javascript:|onerror="/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.match(html, /<ul>/);
+  assert.match(html, /<ol>/);
+  assert.match(html, /href="https:\/\/example.test\/docs"/);
+  assert.match(html, /default-src 'none'/);
+  revision.markdown = '# Example\n\n![Unreviewed](https://example.test/leak.png)\n';
+  await assert.rejects(renderApprovedExport(revision, "html"), /reviewed screenshots/);
+  revision.markdown = '# Example\n\n/Users/person/private-note.md\n';
+  await assert.rejects(renderApprovedExport(revision, "markdown"), /local filesystem path/);
+  assert.equal(exportFilename('../../Domain and Email\r\n"', "markdown"), "domain-and-email.md");
+  assert.equal(exportFilename("CON", "html"), "document-con.html");
+  assert.equal(exportFilename("...", "html"), "document.html");
+});
+
+test("export endpoints require a local session and explicit revision and serve safe attachments", async () => {
+  const fixture = await approvedWorkspaceFixture();
+  const running = await startDocsWorkspaceServer({ workspace: fixture.workspace });
+  try {
+    const endpoint = new URL(`/api/documents/${fixture.document.id}/exports/markdown`, running.url);
+    endpoint.searchParams.set("revisionId", fixture.document.currentRevisionId!);
+    assert.equal((await fetch(endpoint)).status, 401);
+    const page = await fetch(running.url);
+    const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+    const response = await fetch(endpoint, { headers: { cookie } });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-disposition") ?? "", /^attachment; filename="domain-and-email.md"$/);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    const body = await response.text();
+    assert.equal(response.headers.get("x-export-checksum"), exportChecksum(body));
+    endpoint.searchParams.delete("revisionId");
+    assert.equal((await fetch(endpoint, { headers: { cookie } })).status, 400);
+  } finally { await running.close(); }
+});
+
+async function approvedWorkspaceFixture(includeImage = false) {
+  const fixture = await workspaceFixture(includeImage ? { tenantText: "A support mailbox is visible." } : {});
+  let document = await fixture.workspace.generateDocument({ featureId: "feature-mail", objective: "feature-overview" });
+  if (!includeImage) {
+    document = await fixture.workspace.redactTenantWarning(document.id, document.currentRevisionId!,
+      document.revisions!.at(-1)!.tenantWarnings[0]!.id, "[your support email address]");
+    document = await fixture.workspace.validateRevision(document.id, document.currentRevisionId!);
+  }
+  document = await fixture.workspace.reviewScreenshot(document.id, document.currentRevisionId!, "state-mail",
+    includeImage ? "accepted-safe" : "excluded");
+  document = await fixture.workspace.reviewDocument(document.id, document.currentRevisionId!, "approve", true);
+  return { ...fixture, document };
+}
+
 async function workspaceFixture(options: { procedureReady?: boolean; failWriter?: boolean; tenantText?: string; writerTenantText?: string } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "docs-workspace-")); directories.push(root);
   const evidence = path.join(root, "acceptance", "run", "evidence"); const data = path.join(root, "data");
   await mkdir(evidence, { recursive: true });
-  const screenshot = path.join(root, "mail.png"); await writeFile(screenshot, Buffer.from("png-fixture"));
+  const screenshot = path.join(root, "mail.png"); await writeFile(screenshot,
+    Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jhXsAAAAASUVORK5CYII=", "base64"));
   const package_ = evidencePackage(screenshot, options.procedureReady !== false);
   if (options.tenantText) package_.claims.find((item) => item.id === "tenant")!.text = options.tenantText;
   await writeFile(path.join(evidence, "evidence-package.json"), `${JSON.stringify(package_, null, 2)}\n`);

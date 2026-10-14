@@ -168,6 +168,9 @@ export interface RuntimeCaptureManifest {
     timeoutMs: number;
     elapsedMs?: number;
     observation?: RuntimeReadinessObservation;
+    predicate?: "initial-route-content-v1";
+    initialObservation?: RuntimeReadinessObservation;
+    timeoutReason?: "visible-loading-state" | "no-substantive-destination-content" | "unstable-destination-content";
   };
   stages: RuntimeCaptureStages;
   issues: RuntimeCaptureIssue[];
@@ -496,26 +499,28 @@ export async function waitForSemanticRuntimeReadiness(
   const started = Date.now();
   let previousSignature = "";
   let stablePolls = 0;
+  let initialObservation: RuntimeReadinessObservation | undefined;
   let observation: RuntimeReadinessObservation = {
     visibleTextLength: 0, interactiveControlCount: 0, navigationControlCount: 0, stablePolls: 0,
   };
   while (Date.now() - started < boundedTimeout) {
-    const sample = await readSemanticReadiness(page);
-    const signature = `${sample.visibleTextLength}|${sample.interactiveControlCount}|${sample.navigationControlCount}`;
+    const [sample, destination] = await Promise.all([readSemanticReadiness(page), readDestinationContent(page, true)]);
+    const signature = `${destination.contentSignature}|${destination.semanticSignatures.join("|")}|${destination.loadingIndicatorCount}`;
     stablePolls = signature === previousSignature ? stablePolls + 1 : 1;
     previousSignature = signature;
-    observation = { ...sample, stablePolls };
-    const meaningfulText = sample.visibleTextLength >= 20;
-    const interactive = sample.interactiveControlCount > 0;
-    const stableShell = sample.navigationControlCount > 0 || stablePolls >= 2;
-    if (meaningfulText && interactive && stableShell) {
+    observation = { ...sample, stablePolls, destinationEvidenceCount: destination.substantiveEvidenceCount,
+      loadingIndicatorCount: destination.loadingIndicatorCount };
+    initialObservation ??= observation;
+    if (destination.substantiveEvidenceCount > 0 && destination.loadingIndicatorCount === 0 && stablePolls >= 2) {
       return { status: "ready", reason: "semantic-ui", timeoutMs: boundedTimeout,
-        elapsedMs: Date.now() - started, observation };
+        elapsedMs: Date.now() - started, observation, initialObservation, predicate: "initial-route-content-v1" };
     }
     await page.waitForTimeout(Math.min(200, Math.max(1, boundedTimeout - (Date.now() - started))));
   }
   return { status: "partial", reason: "semantic-timeout", timeoutMs: boundedTimeout,
-    elapsedMs: Date.now() - started, observation };
+    elapsedMs: Date.now() - started, observation, ...(initialObservation ? { initialObservation } : {}), predicate: "initial-route-content-v1",
+    timeoutReason: observation.loadingIndicatorCount ? "visible-loading-state" :
+      !observation.destinationEvidenceCount ? "no-substantive-destination-content" : "unstable-destination-content" };
 }
 
 export async function captureDestinationReadinessBaseline(page: Page): Promise<RuntimeDestinationBaseline> {
@@ -550,21 +555,55 @@ export async function waitForDestinationRuntimeReadiness(page: Page, timeoutMs: 
     elapsedMs: Date.now() - started, observation };
 }
 
-async function readDestinationContent(page: Page): Promise<{ contentSignature: string; semanticSignatures: string[];
-  loadingIndicatorCount: number; errorState: boolean }> {
-  return page.evaluate(() => {
+async function readDestinationContent(page: Page, initial = false): Promise<{ contentSignature: string; semanticSignatures: string[];
+  loadingIndicatorCount: number; errorState: boolean; substantiveEvidenceCount: number }> {
+  return page.evaluate((initial) => {
     const roots = [...document.querySelectorAll("main,[role=main]")].filter((element) => {
       const html = element as HTMLElement; const style = getComputedStyle(html); const rect = html.getBoundingClientRect();
       return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
         rect.width > 0 && rect.height > 0;
     });
     const root = roots[0] ?? document.body;
-    const loading = [...root.querySelectorAll('[role="progressbar"],[aria-busy="true"],[data-loading="true"],.loading,.spinner')]
+    const shellSelector = 'nav,aside,header,footer,[role="navigation"],[role="banner"],[role="contentinfo"],[role="tablist"],[role="menubar"],[role="menu"]';
+    const checks = {
+      visible(element: Element) {
+        const style = getComputedStyle(element); const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
+          rect.width > 0 && rect.height > 0;
+      },
+      eligible(element: Element) {
+        const anchor = element.closest('a[href]');
+        return !initial || (!element.closest(shellSelector) && !element.closest('[role="tab"],[role="menuitem"]') &&
+          !(anchor && /^\s*skip\b/i.test((anchor as HTMLElement).innerText)));
+      },
+      substantive(element: Element) {
+        if (!checks.eligible(element) || !checks.visible(element) ||
+          element.closest('a[href],button,[role="button"],[role="link"]')) return false;
+        if (element.matches('input,select,textarea,[contenteditable="true"]')) return true;
+        if (element.matches('ul,ol,dl,[role="list"]')) {
+          const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+          let text = "";
+          while (walker.nextNode()) {
+            const parent = walker.currentNode.parentElement;
+            if (parent && checks.eligible(parent) && checks.visible(parent) &&
+              !parent.closest('a[href],button,[role="button"],[role="link"]')) text += walker.currentNode.textContent ?? "";
+          }
+          return text.trim().length >= 3;
+        }
+        return ((element as HTMLElement).innerText ?? "").trim().length >= (element.matches("p,article") ? 20 : 3);
+      },
+    };
+    const loadingSelector = '[role="progressbar"],[aria-busy="true"],[data-loading="true"],.loading,.spinner';
+    // Initial capture has no transition baseline: count only substantive content outside the shared shell.
+    const loading = (initial ? [root, ...root.querySelectorAll("*")].filter((element) =>
+      element.matches(loadingSelector) || /(?:^|[\s_-])(preloader|loader|loading|spinner|skeleton)(?:$|[\s_-])/i.test(element.getAttribute("class") ?? "") ||
+      (element.children.length === 0 && /^(loading|please wait|fetching|preparing)(?:\s|[.\u2026]|$)/i.test((element as HTMLElement).innerText ?? ""))) :
+      [...root.querySelectorAll(loadingSelector)]).filter(checks.eligible)
       .filter((element) => { const html = element as HTMLElement; const style = getComputedStyle(html);
         const rect = html.getBoundingClientRect(); return style.display !== "none" && style.visibility !== "hidden" &&
           Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0; });
     const selectors = 'h1,h2,h3,[role="heading"],button,a[href],input,select,textarea,[role="tab"],[role="menuitem"],[role="alert"]';
-    const semanticSignatures = [...root.querySelectorAll(selectors)].filter((element) => {
+    const semanticSignatures = [...root.querySelectorAll(selectors)].filter(checks.eligible).filter((element) => {
       const html = element as HTMLElement; const style = getComputedStyle(html); const rect = html.getBoundingClientRect();
       return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
         rect.width > 0 && rect.height > 0;
@@ -574,19 +613,31 @@ async function readDestinationContent(page: Page): Promise<{ contentSignature: s
         element.getAttribute("name") ?? "", (html.innerText || element.getAttribute("placeholder") || "").replace(/\s+/g, " ").trim()]
         .join(":");
     }).filter((item) => item.replace(/:/g, "").trim()).sort();
-    const text = ((root as HTMLElement | undefined)?.innerText ?? "").replace(/\s+/g, " ").trim();
+    let text = ((root as HTMLElement | undefined)?.innerText ?? "").replace(/\s+/g, " ").trim();
+    if (initial) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const parts: string[] = [];
+      while (walker.nextNode()) {
+        const parent = walker.currentNode.parentElement;
+        if (parent && checks.eligible(parent) && checks.visible(parent)) parts.push(walker.currentNode.textContent ?? "");
+      }
+      text = parts.join(" ").replace(/\s+/g, " ").trim();
+    }
     const structure = [...root.querySelectorAll("section,article,form,table,[role=dialog],[role=alert]")]
       .filter((element) => { const html = element as HTMLElement; const style = getComputedStyle(html);
         const rect = html.getBoundingClientRect(); return style.display !== "none" && style.visibility !== "hidden" &&
           Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0; })
       .map((element) => `${element.tagName}:${element.getAttribute("role") ?? ""}`).sort();
-    return { contentSignature: `${text}|${structure.join(",")}`, semanticSignatures,
+    const substantiveEvidenceCount = initial ? [...root.querySelectorAll(
+      'h1,h2,h3,[role="heading"],input:not([type="hidden"]),select,textarea,[contenteditable="true"],table,[role="grid"],ul,ol,dl,[role="list"],article,[role="dialog"],[role="alert"],p',
+    )].filter((element) => !loading.includes(element) && checks.substantive(element)).length : 0;
+    return { contentSignature: `${text}|${structure.join(",")}`, semanticSignatures, substantiveEvidenceCount,
       loadingIndicatorCount: loading.length, errorState: [...root.querySelectorAll('[role="alert"]')].some((element) => {
         const html = element as HTMLElement; const style = getComputedStyle(html); const rect = html.getBoundingClientRect();
         return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 &&
           rect.width > 0 && rect.height > 0;
       }) };
-  });
+  }, initial);
 }
 
 async function readSemanticReadiness(page: Page): Promise<Omit<RuntimeReadinessObservation, "stablePolls">> {

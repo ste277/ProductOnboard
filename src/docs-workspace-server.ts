@@ -72,6 +72,19 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return json(response, 200, await workspace.listDocuments());
   }
   const documentMatch = /^\/api\/documents\/(document-[0-9a-f-]{36})$/.exec(url.pathname);
+  const availabilityMatch = /^\/api\/documents\/(document-[0-9a-f-]{36})\/export-availability$/.exec(url.pathname);
+  if (request.method === "GET" && availabilityMatch) {
+    return json(response, 200, await workspace.exportAvailability(availabilityMatch[1]!));
+  }
+  const exportMatch = /^\/api\/documents\/(document-[0-9a-f-]{36})\/exports\/(markdown|html)$/.exec(url.pathname);
+  if (request.method === "GET" && exportMatch) {
+    const revisionId = url.searchParams.get("revisionId");
+    if (!revisionId) return json(response, 400, { message: "Select the explicitly approved revision to export" });
+    const exported = await workspace.exportDocument(exportMatch[1]!, revisionId, exportMatch[2] as "markdown" | "html");
+    response.setHeader("content-disposition", `attachment; filename="${exported.filename}"`);
+    response.setHeader("x-export-checksum", exported.record.resultChecksum);
+    return text(response, 200, exported.contentType, exported.body);
+  }
   if (request.method === "GET" && documentMatch) {
     const document = await workspace.getDocument(documentMatch[1]!);
     return document ? json(response, 200, document) : json(response, 404, { message: "Document not found" });

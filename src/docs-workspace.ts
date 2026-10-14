@@ -13,6 +13,8 @@ import {
 import { runKnowledgeWriterHarness } from "./knowledge-writer-harness.js";
 import type { RuntimeNavigationDiscoveryGraph } from "./runtime-discovery.js";
 import type { ScreenshotStepMapping } from "./screenshot-step-mapping.js";
+import { assertApprovedExport, exportChecksum, exportFilename, renderApprovedExport, revisionSnapshotChecksum,
+  type DocumentExport, type DocumentExportFormat, type DocumentExportRecord, type ExportAvailability } from "./docs-workspace-export.js";
 
 export type DocsWorkspaceObjective = "feature-overview" | "how-to-guide";
 export type DocumentGenerationStatus = "generating" | "succeeded" | "failed";
@@ -102,6 +104,8 @@ export interface DocumentAuditEntry {
   reviewer: string;
   validationStatus: RevisionValidationStatus;
   evidencePackageChecksum: string;
+  revisionChecksum?: string;
+  revisionSnapshotChecksum?: string;
 }
 
 export interface DocsWorkspaceDocument {
@@ -407,6 +411,48 @@ export class DocsWorkspace {
     return structuredClone(document);
   }
 
+  async exportAvailability(documentId: string): Promise<ExportAvailability> {
+    const availability: ExportAvailability = { markdown: { available: false }, html: { available: false } };
+    for (const format of ["markdown", "html"] as const) {
+      try {
+        const document = await this.requireDocument(documentId);
+        await this.prepareExport(documentId, document.currentRevisionId ?? "", format);
+        availability[format] = { available: true };
+      } catch (error) {
+        availability[format] = { available: false, reason: error instanceof Error ? error.message : "Export is unavailable" };
+      }
+    }
+    return availability;
+  }
+
+  async exportDocument(documentId: string, revisionId: string, format: DocumentExportFormat): Promise<DocumentExport> {
+    const prepared = await this.prepareExport(documentId, revisionId, format);
+    const record: DocumentExportRecord = { id: `export-${randomUUID()}`, documentId, revisionId,
+      revisionChecksum: prepared.revision.checksum, evidencePackageChecksum: prepared.document.evidencePackageChecksum,
+      format, exportedAt: this.now().toISOString(), resultChecksum: exportChecksum(prepared.body) };
+    const directory = path.join(this.documentDirectory(documentId), "exports");
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const target = path.join(directory, `${record.id}.json`);
+    const temporary = `${target}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, target);
+    return { filename: exportFilename(prepared.revision.title, format), body: prepared.body, record,
+      contentType: format === "markdown" ? "text/markdown; charset=utf-8" : "text/html; charset=utf-8" };
+  }
+
+  private async prepareExport(documentId: string, revisionId: string, format: DocumentExportFormat) {
+    if (!validDocumentId(documentId)) throw new Error("Document not found");
+    if (format !== "markdown" && format !== "html") throw new Error("Unsupported export format");
+    const document = await this.readDocument(documentId);
+    const revision = assertApprovedExport(document, revisionId);
+    const package_ = await this.readFrozenEvidence(document);
+    const grounding = revalidateMarkdown(revision.markdown, document.article, package_);
+    if (grounding.issues.length || detectTenantWarnings(revision.markdown).length) {
+      throw new Error("Approved content requires grounding or tenant-data review");
+    }
+    return { document, revision, body: await renderApprovedExport(revision, format) };
+  }
+
   private async catalog(): Promise<CatalogEntry[]> {
     const packagePaths = await findNamedFiles(path.resolve(this.options.evidenceRoot), "evidence-package.json");
     const entries: CatalogEntry[] = [];
@@ -558,7 +604,9 @@ function initialRevision(markdown: string, title: string, timestamp: string, rev
 function auditEntry(document: DocsWorkspaceDocument, revision: DocumentRevision, action: ReviewAction,
   timestamp: string, reviewer: string): DocumentAuditEntry {
   return { id: `audit-${randomUUID()}`, revisionId: revision.id, action, timestamp, reviewer,
-    validationStatus: revision.validation.status, evidencePackageChecksum: document.evidencePackageChecksum };
+    validationStatus: revision.validation.status, evidencePackageChecksum: document.evidencePackageChecksum,
+    ...(action === "approved" ? { revisionChecksum: revision.checksum,
+      revisionSnapshotChecksum: revisionSnapshotChecksum(revision) } : {}) };
 }
 
 function currentRevision(document: DocsWorkspaceDocument): DocumentRevision {

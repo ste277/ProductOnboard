@@ -58,6 +58,7 @@ function updateReadiness(){const feature=state.features.find(f=>f.id===document.
 async function generate(){const button=document.querySelector('#generate');const featureId=document.querySelector('#feature').value;const objective=document.querySelector('input[name="objective"]:checked').value;button.disabled=true;button.textContent='Generating...';document.querySelector('#generation-error').innerHTML='';try{const document_=await api('/api/documents/generate',{method:'POST',body:JSON.stringify({featureId,objective})});state.documents.unshift(document_);if(document_.generationStatus==='failed')throw new Error(document_.failure?.message||'Generation failed');navigate('/docs/'+document_.id)}catch(error){document.querySelector('#generation-error').innerHTML='<div class="error-box">'+esc(error.message)+'</div>';button.disabled=false;button.textContent='Generate grounded draft'}}
 async function renderReview(id){
   let d=await api('/api/documents/'+encodeURIComponent(id));
+  let exportStatus=await api('/api/documents/'+encodeURIComponent(id)+'/export-availability');
   if(!d.article){app.innerHTML='<div class="error-box">'+esc(d.failure?.message||'Document is not ready.')+'</div>';return}
   const revision=()=>d.revisions.find(r=>r.id===d.currentRevisionId);
   let saving=false;
@@ -81,7 +82,9 @@ async function renderReview(id){
       '<label class="approval-confirm"><input id="approve-confirm" type="checkbox"> I have reviewed this revision and confirm approval</label>'+
       '<button id="request-changes" class="button secondary">Request changes</button><button id="save" class="button secondary">Save draft</button>'+
       '<button id="validate" class="button">Revalidate</button><button id="approve" class="button approve" '+(!ready?'disabled':'')+'>Approve</button></div></section>'+
-      '<aside class="side-stack"><section class="panel side-panel"><h2>Validation</h2><dl class="metadata">'+
+      '<aside class="side-stack"><section class="panel side-panel"><h2>Export</h2><div class="export-actions">'+
+      ['markdown','html'].map(format=>'<div><button class="button secondary small" data-export="'+format+'" '+(!exportStatus[format].available?'disabled':'')+'>Download '+(format==='markdown'?'Markdown':'HTML')+'</button>'+(!exportStatus[format].available?'<p class="subtle">'+esc(exportStatus[format].reason)+'</p>':'')+'</div>').join('')+
+      '</div><p id="export-message" role="status" class="subtle"></p></section><section class="panel side-panel"><h2>Validation</h2><dl class="metadata">'+
       '<div class="metadata-row"><dt>Status</dt><dd>'+badge(r.validation.status,r.validation.status==='passed'?'success':r.validation.status==='failed'?'danger':'warning')+'</dd></div>'+
       '<div class="metadata-row"><dt>Supported</dt><dd>'+r.validation.supportedStatements+'</dd></div><div class="metadata-row"><dt>Unsupported</dt><dd>'+r.validation.unsupportedStatements+'</dd></div></dl>'+
       r.validation.issues.map(i=>'<div class="issue"><strong>'+esc(i.type.replaceAll('-',' '))+'</strong><p>'+esc(i.text)+'</p><span class="subtle">'+esc(i.message)+'</span></div>').join('')+'</section>'+
@@ -107,7 +110,7 @@ async function renderReview(id){
   };
   const mutation=async(url,body)=>{
     if(dirty){notice('Save your changes first.');return}
-    try{d=await api(url,{method:'POST',body:JSON.stringify(body)});draw();notice('Document updated')}
+    try{d=await api(url,{method:'POST',body:JSON.stringify(body)});exportStatus=await api('/api/documents/'+d.id+'/export-availability');draw();notice('Document updated')}
     catch(error){notice(error.message)}
   };
   const bind=()=>{
@@ -118,6 +121,7 @@ async function renderReview(id){
       document.querySelector('#save-status').textContent='Unsaved changes';
       document.querySelector('#validate').disabled=true;
       document.querySelector('#approve').disabled=true;
+      document.querySelectorAll('[data-export]').forEach(button=>button.disabled=true);
     };
     [title,markdown].forEach(el=>el.addEventListener('input',changed));
     document.querySelectorAll('[data-prefix]').forEach(button=>button.addEventListener('click',()=>{insertPrefix(markdown,button.dataset.prefix);changed()}));
@@ -134,7 +138,7 @@ async function renderReview(id){
       document.querySelectorAll('.editor-toolbar button').forEach(button=>button.disabled=true);
       try{
         d=await api('/api/documents/'+d.id+'/revisions',{method:'POST',body:JSON.stringify({expectedRevisionId:d.currentRevisionId,title:title.value,markdown:markdown.value})});
-        dirty=false;draw();notice('Draft saved');
+        dirty=false;exportStatus=await api('/api/documents/'+d.id+'/export-availability');draw();notice('Draft saved');
       }catch(error){
         dirty=true;status.textContent='Save failed';
         document.querySelector('#save-error').textContent=error.message;
@@ -149,6 +153,22 @@ async function renderReview(id){
     document.querySelector('#approve').addEventListener('click',()=>mutation('/api/documents/'+d.id+'/review',{expectedRevisionId:d.currentRevisionId,action:'approve',confirmed:document.querySelector('#approve-confirm').checked}));
     document.querySelectorAll('[data-redact]').forEach(button=>button.addEventListener('click',()=>mutation('/api/documents/'+d.id+'/tenant-redactions',{expectedRevisionId:d.currentRevisionId,warningId:button.dataset.redact,placeholder:document.querySelector('[data-placeholder="'+button.dataset.redact+'"]').value})));
     document.querySelectorAll('[data-image-safe],[data-image-exclude]').forEach(button=>button.addEventListener('click',()=>mutation('/api/documents/'+d.id+'/screenshot-reviews',{expectedRevisionId:d.currentRevisionId,stateId:button.dataset.imageSafe||button.dataset.imageExclude,disposition:button.dataset.imageSafe?'accepted-safe':'excluded'})));
+    document.querySelectorAll('[data-export]').forEach(button=>button.addEventListener('click',async()=>{
+      if(dirty){notice('Save and approve your changes before exporting.');return}
+      button.disabled=true;
+      const message=document.querySelector('#export-message');
+      message.textContent='Preparing download';
+      try{
+        const response=await fetch('/api/documents/'+d.id+'/exports/'+button.dataset.export+'?revisionId='+encodeURIComponent(d.currentRevisionId));
+        if(!response.ok){const error=await response.json();throw new Error(error.message||'Export failed')}
+        const filename=/filename="([^"]+)"/.exec(response.headers.get('content-disposition')||'')?.[1]||'document.'+(button.dataset.export==='markdown'?'md':'html');
+        const objectUrl=URL.createObjectURL(await response.blob());
+        const anchor=document.createElement('a');anchor.href=objectUrl;anchor.download=filename;document.body.append(anchor);anchor.click();anchor.remove();
+        setTimeout(()=>URL.revokeObjectURL(objectUrl),60000);
+        message.textContent='Download ready';
+      }catch(error){message.textContent=error.message}
+      finally{button.disabled=false}
+    }));
   };
   draw();
 }
